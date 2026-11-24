@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key><string>Crate</string>
+    <key>CFBundleDisplayName</key><string>Crate</string>
+    <key>CFBundleIdentifier</key><string>app.crate.Crate</string>
+    <key>CFBundleExecutable</key><string>Crate</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>14.0</string>
+    <key>LSApplicationCategoryType</key><string>public.app-category.music</string>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Crate controls the Spotify app to play Spotify tracks from your crates and queue.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Crate reads the music folders you add from external drives.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Crate reads music in folders you add to the library, and the agent looks for audio files you ask it to find.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Crate reads music in folders you add to the library, and the agent looks for audio files you ask it to find.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Crate reads music in folders you add to the library, and the agent looks for audio files you ask it to find.</string>
+</dict>
+</plist>
