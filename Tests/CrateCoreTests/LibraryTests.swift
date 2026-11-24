@@ -241,6 +241,23 @@ final class LibraryStoreTests: XCTestCase {
         XCTAssertEqual(try store.cues(id: id), [1: 13, 3: 64])
         try store.setCue(id: id, slot: 3, position: nil)
         XCTAssertEqual(try store.cues(id: id), [1: 13])
+
+        // A cue can have a name, and an end that makes it a saved loop.
+        try store.setCuePoint(id: id, CuePoint(slot: 1, position: 13, name: "Drop"))
+        try store.setCuePoint(id: id, CuePoint(slot: 7, position: 32, name: "Intro loop", loopEnd: 40))
+        XCTAssertEqual(try store.cuePoints(id: id), [
+            CuePoint(slot: 1, position: 13, name: "Drop"), CuePoint(slot: 7, position: 32, name: "Intro loop", loopEnd: 40),
+        ])
+        // Moved by its pad, a cue keeps its name and a loop keeps its length.
+        try store.setCue(id: id, slot: 1, position: 14)
+        try store.setCue(id: id, slot: 7, position: 30)
+        XCTAssertEqual(try store.cuePoints(id: id), [
+            CuePoint(slot: 1, position: 14, name: "Drop"), CuePoint(slot: 7, position: 30, name: "Intro loop", loopEnd: 38),
+        ])
+        XCTAssertNil(CuePoint(slot: 2, position: 10, loopEnd: 9).loopEnd, "a loop that ends before it starts is no loop")
+        // All at once, as the cue editor's undo and the agent do.
+        try store.setCuePoints(id: id, [CuePoint(slot: 4, position: 5, name: "Start"), CuePoint(slot: 9, position: 1)])
+        XCTAssertEqual(try store.cuePoints(id: id), [CuePoint(slot: 4, position: 5, name: "Start")], "there are eight pads")
     }
 
     func testUpdateRejectsAnUnreadableKeyAndUnknownTrack() throws {

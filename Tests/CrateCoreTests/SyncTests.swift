@@ -55,6 +55,7 @@ final class SyncTests: XCTestCase {
         let studio = try library("Studio"), laptop = try library("Laptop")
         let one = try add("One", to: studio, bpm: 124), two = try add("Two", to: studio), three = try add("Three", to: studio)
         try studio.setCue(id: one, slot: 2, position: 31.5)
+        try studio.setCuePoint(id: one, CuePoint(slot: 5, position: 64, name: "Outro loop", loopEnd: 72))
         let grid = BeatGrid(bpm: 124, firstBeat: 0.1, duration: 300).withMarkers().shifted(by: 0.004)
         try studio.setBeatGrid(id: one, grid, edited: true)
         try studio.setAnalysis(id: two, bpm: 120, key: "8A", waveform: Data([1, 2, 3]), detail: WaveDetail(columnsPerSecond: 50, bytes: [9, 8, 7]))
@@ -67,7 +68,10 @@ final class SyncTests: XCTestCase {
         let arrived = try XCTUnwrap(try laptop.track(contentID: "c1:1000:One"))
         XCTAssertFalse(arrived.isOnThisMac, "the file is still on the other Mac")
         XCTAssertEqual(arrived.bpm, 124)
-        XCTAssertEqual(try laptop.cues(id: arrived.id), [2: 31.5])
+        XCTAssertEqual(try laptop.cues(id: arrived.id), [2: 31.5, 5: 64])
+        XCTAssertEqual(
+            try laptop.cuePoints(id: arrived.id), [CuePoint(slot: 2, position: 31.5), CuePoint(slot: 5, position: 64, name: "Outro loop", loopEnd: 72)],
+            "a cue's name and a saved loop's length cross with it")
         XCTAssertEqual(try laptop.beatGrid(id: arrived.id), grid)
         XCTAssertEqual(try titles(in: "Disco", of: laptop), ["Three", "One"])
         XCTAssertEqual(try laptop.holders(of: "c1:1000:One"), [studio.deviceID])

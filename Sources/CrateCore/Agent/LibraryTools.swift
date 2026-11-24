@@ -370,6 +370,17 @@ public enum LibraryTools {
         })
 
         registry.register(AgentTool(
+            name: "crate_rename",
+            description: "Give a crate a new name. Fails if another crate has that name.",
+            properties: ["crate": Schema.string("The crate's name now."), "name": Schema.string("Its new name.")],
+            required: ["crate", "name"]
+        ) { args in
+            let crate = try context.crate(args)
+            try store.renameCrate(id: crate.id, to: try args.requiredString("name"))
+            return ["was": .string(crate.name), "crate": .string(try store.crate(id: crate.id)?.name ?? crate.name)]
+        })
+
+        registry.register(AgentTool(
             name: "crate_add_tracks",
             description: "Add tracks to the end of a crate. Tracks already in the crate are left where they are.",
             properties: ["crate": Schema.string("Crate name."), "tracks": Schema.trackRefs("Tracks to add, in order.")],

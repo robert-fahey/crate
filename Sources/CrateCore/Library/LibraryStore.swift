@@ -188,6 +188,34 @@ public final class LibraryStore {
                 try db.execute("PRAGMA user_version = 6")
             }
         }
+        if version < 7 {
+            // Cue points with names, and cues that are saved loops.
+            try db.transaction {
+                try db.execute("ALTER TABLE cues ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+                try db.execute("ALTER TABLE cues ADD COLUMN loop_end REAL")
+                try db.execute("PRAGMA user_version = 7")
+            }
+        }
+        if version < 8 {
+            // A crate's mix: how each track goes into the one after it.
+            try db.transaction {
+                try db.execute("""
+                    CREATE TABLE mix_steps (
+                        crate_id INTEGER NOT NULL REFERENCES crates(id) ON DELETE CASCADE,
+                        from_track INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+                        to_track INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+                        style TEXT NOT NULL,
+                        beats REAL NOT NULL,
+                        out_at REAL NOT NULL,
+                        in_at REAL NOT NULL,
+                        note TEXT NOT NULL DEFAULT '',
+                        author TEXT NOT NULL DEFAULT '',
+                        PRIMARY KEY (crate_id, from_track, to_track)
+                    )
+                    """)
+                try db.execute("PRAGMA user_version = 8")
+            }
+        }
     }
 
     func changed() {
@@ -615,11 +643,45 @@ public final class LibraryStore {
         return cues
     }
 
-    /// Sets a cue point, or removes it when `position` is nil.
+    /// Cue points in slot order, with their names and, for saved loops, where the loop ends.
+    public func cuePoints(id: Int64) throws -> [CuePoint] {
+        try db.query("SELECT slot, position, name, loop_end FROM cues WHERE track_id = ? ORDER BY slot", [.int(id)]).compactMap { row in
+            guard let slot = row.int("slot"), let position = row.double("position") else { return nil }
+            return CuePoint(slot: Int(slot), position: position, name: row.string("name") ?? "", loopEnd: row.double("loop_end"))
+        }
+    }
+
+    /// Replaces a track's cue points with these, all at once.
+    public func setCuePoints(id: Int64, _ cues: [CuePoint]) throws {
+        try db.transaction {
+            try db.execute("DELETE FROM cues WHERE track_id = ?", [.int(id)])
+            for cue in cues where CuePoint.slots.contains(cue.slot) {
+                try db.execute(
+                    "INSERT OR REPLACE INTO cues (track_id, slot, position, name, loop_end) VALUES (?, ?, ?, ?, ?)",
+                    [.int(id), .int(Int64(cue.slot)), .double(max(0, cue.position)), .text(cue.name), .optional(cue.loopEnd)])
+            }
+            try db.execute("UPDATE tracks SET cues_at = ? WHERE id = ?", [.double(clock()), .int(id)])
+        }
+        changed()
+    }
+
+    /// Sets one cue point, name and loop included, leaving the others as they are.
+    public func setCuePoint(id: Int64, _ cue: CuePoint) throws {
+        try db.execute(
+            "INSERT OR REPLACE INTO cues (track_id, slot, position, name, loop_end) VALUES (?, ?, ?, ?, ?)",
+            [.int(id), .int(Int64(cue.slot)), .double(max(0, cue.position)), .text(cue.name), .optional(cue.loopEnd)])
+        try db.execute("UPDATE tracks SET cues_at = ? WHERE id = ?", [.double(clock()), .int(id)])
+        changed()
+    }
+
+    /// Sets a cue point, or removes it when `position` is nil. A cue that is moved keeps its name; a loop moves whole.
     public func setCue(id: Int64, slot: Int, position: Double?) throws {
         if let position {
             try db.execute(
-                "INSERT OR REPLACE INTO cues (track_id, slot, position) VALUES (?, ?, ?)",
+                """
+                INSERT INTO cues (track_id, slot, position) VALUES (?, ?, ?)
+                ON CONFLICT(track_id, slot) DO UPDATE SET loop_end = loop_end + (excluded.position - position), position = excluded.position
+                """,
                 [.int(id), .int(Int64(slot)), .double(position)])
         } else {
             try db.execute("DELETE FROM cues WHERE track_id = ? AND slot = ?", [.int(id), .int(Int64(slot))])
@@ -899,6 +961,13 @@ public final class LibraryStore {
 
     public func setting(_ key: String) -> String? {
         try? db.query("SELECT value FROM settings WHERE key = ?", [.text(key)]).first?.string("value")
+    }
+
+    /// Removes every setting whose name starts with `prefix`.
+    public func removeSettings(prefix: String) {
+        let escaped = prefix.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "%", with: "\\%").replacingOccurrences(of: "_", with: "\\_")
+        _ = try? db.execute("DELETE FROM settings WHERE key LIKE ? ESCAPE '\\'", [.text(escaped + "%")])
     }
 
     public func setSetting(_ key: String, _ value: String?) {

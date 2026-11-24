@@ -46,9 +46,9 @@ struct DecksView: View {
                 }
             }
             HStack(alignment: .top, spacing: 10) {
-                DeckControls(deck: mixer.deck(.a), zoom: zoom) { model.gridEditing = .a }
+                DeckControls(deck: mixer.deck(.a), zoom: zoom, editGrid: { model.gridEditing = .a }, editCues: { model.cueEditing = .a })
                 MixerCenter(mixer: mixer, player: model.player, director: model.director, isLarge: $isLarge)
-                DeckControls(deck: mixer.deck(.b), zoom: zoom) { model.gridEditing = .b }
+                DeckControls(deck: mixer.deck(.b), zoom: zoom, editGrid: { model.gridEditing = .b }, editCues: { model.cueEditing = .b })
             }
             .fixedSize(horizontal: false, vertical: true)
         }
@@ -179,6 +179,7 @@ private struct DeckControls: View {
     @Bindable var deck: DeckModel
     let zoom: Double
     let editGrid: () -> Void
+    var editCues: () -> Void = {}
     @Environment(\.deckScale) private var scale
     /// The width inside the card, which decides whether each row fits on one line.
     @State private var width: CGFloat = 600
@@ -247,9 +248,12 @@ private struct DeckControls: View {
 
     private var transportButtons: some View {
         HStack(spacing: 7 * scale) {
-            Button("CUE") { deck.cue() }
-                .buttonStyle(TransportButtonStyle(colors: colors, size: 38))
-                .help("While playing: back to the cue point and stop. While stopped: set the cue point here.")
+            // Acts on the way down and again on the way up, so the click itself does nothing.
+            Button("CUE") {}
+                .buttonStyle(TransportButtonStyle(isOn: deck.isCueing, colors: colors, size: 38) { down in
+                    if down { deck.cueDown() } else { deck.cueUp() }
+                })
+                .help("Hold to play from the cue point; let go to return to it. While playing: back to the cue point and stop. Stopped somewhere else: sets the cue point there.")
             Button { deck.togglePlay() } label: {
                 Image(systemName: deck.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 15 * scale, weight: .black))
             }
@@ -338,10 +342,20 @@ private struct DeckControls: View {
                     .buttonStyle(PadButtonStyle(isOn: deck.cues[slot] != nil, color: WaveMarks.color(forCue: slot), minWidth: 24, height: 24))
                     .contextMenu {
                         Button("Clear Cue \(slot)") { deck.clearHotCue(slot) }.disabled(deck.cues[slot] == nil)
+                        Button("Edit Cue Points…") { editCues() }
                     }
-                    .help(deck.cues[slot] == nil ? "Set hot cue \(slot) here" : "Jump to hot cue \(slot). Right-click to clear.")
+                    .help(padHelp(slot))
             }
+            Button("EDIT") { editCues() }
+                .buttonStyle(PadButtonStyle(minWidth: 38, height: 24))
+                .help("The cue editor: name the pads, move them along the waveform, make saved loops, and have cues suggested")
         }
+    }
+
+    private func padHelp(_ slot: Int) -> String {
+        guard let cue = deck.cuePoints[slot] else { return "Set hot cue \(slot) here" }
+        let name = cue.name.isEmpty ? "hot cue \(slot)" : "“\(cue.name)”"
+        return cue.isLoop ? "Go to \(name) and loop it. Right-click to clear or edit." : "Jump to \(name). Right-click to clear or edit."
     }
 
     private var effects: some View {
@@ -395,6 +409,7 @@ private struct MixerCenter: View {
     let player: PlayerController
     @Bindable var director: MixDirector
     @Binding var isLarge: Bool
+    @AppStorage("sampler.shown") private var showsSampler = false
     @Environment(\.deckScale) private var scale
 
     var body: some View {
@@ -459,6 +474,11 @@ private struct MixerCenter: View {
             HStack(spacing: 8 * scale) {
                 Knob(value: $mixer.masterVolume, range: 0...1, resting: 1, label: "VOLUME", size: 30)
                 status.frame(maxWidth: .infinity, alignment: .leading)
+                Button { showsSampler.toggle() } label: {
+                    Image(systemName: "square.grid.3x2.fill")
+                }
+                .buttonStyle(PadButtonStyle(isOn: showsSampler, color: .white, minWidth: 26))
+                .help(showsSampler ? "Hide the sampler" : "Show the sampler: eight pads for one-shot sounds and loops")
                 Button { isLarge.toggle() } label: {
                     Image(systemName: isLarge ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
                 }

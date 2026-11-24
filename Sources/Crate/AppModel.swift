@@ -11,6 +11,21 @@ enum SidebarItem: Hashable {
     case crate(Int64)
 }
 
+/// What is typed in the agent's text field. It is kept apart from the rest of the window's
+/// state so that typing redraws the field and nothing else.
+@MainActor
+@Observable
+final class AgentDraft {
+    var text = ""
+    /// Counts requests to put the cursor in the field: ⌘K, or a suggestion that needs finishing.
+    private(set) var focusRequests = 0
+    /// Counts requests sent, so the conversation can open to show the reply.
+    private(set) var sent = 0
+
+    func focus() { focusRequests += 1 }
+    func didSend() { sent += 1 }
+}
+
 /// Everything the main window shows, and the actions behind its controls.
 @MainActor
 @Observable
@@ -20,6 +35,7 @@ final class AppModel {
     let player: PlayerController
     let director: MixDirector
     let agent: AgentSession
+    let draft = AgentDraft()
     let spotify: SpotifyAPI
     let tidal: TidalAPI
     let sharing: SharingModel
@@ -54,10 +70,16 @@ final class AppModel {
     var editing: Track?
     /// The deck whose beat grid is open in the grid editor.
     var gridEditing: DeckID?
+    /// The deck whose cue points are open in the cue editor.
+    var cueEditing: DeckID?
+    /// The crate whose mix is open in the mix editor.
+    var mixEditing: Int64?
 
     @ObservationIgnored private let scanner: LibraryScanner
     @ObservationIgnored private let registry = ToolRegistry()
     @ObservationIgnored private var reloadScheduled = false
+    /// What was left unsent in each conversation's text field.
+    @ObservationIgnored private var drafts: [ConversationID: String] = [:]
     @ObservationIgnored private var analysisTask: Task<Void, Never>?
     @ObservationIgnored private var fingerprintTask: Task<Void, Never>?
 
@@ -73,6 +95,8 @@ final class AppModel {
         LibraryTools.register(into: registry, context: context)
         PlayerTools.register(into: registry, context: context, player: player)
         DeckTools.register(into: registry, context: context, mix: director)
+        CueTools.register(into: registry, context: context)
+        MixPlanTools.register(into: registry, context: context)
         director.agent = agent
         // CRATE_DB marks a test run: keep it away from the real keychain.
         let secrets: SecretStore = ProcessInfo.processInfo.environment["CRATE_DB"] == nil ? KeychainStore() : MemorySecretStore()
@@ -199,6 +223,7 @@ final class AppModel {
             alert = error.localizedDescription
         }
         if case .crate(let id) = sidebar, !crates.contains(where: { $0.id == id }) { sidebar = .all }
+        showConversation()
         selection.formIntersection(Set(tracks.map(\.id)))
         refreshAvailability()
         player.refreshWaveform()
@@ -249,6 +274,83 @@ final class AppModel {
     }
 
     var selectedTracks: [Track] { tracks.filter { selection.contains($0.id) } }
+
+    // MARK: Agent
+
+    /// The crate the list is showing, if it is showing one.
+    var currentCrate: Crate? {
+        guard case .crate(let id) = sidebar else { return nil }
+        return crates.first { $0.id == id }
+    }
+
+    /// The agent's conversation follows the sidebar: a crate's own while that crate is shown, the library's otherwise.
+    private func showConversation() {
+        let was = agent.conversation
+        if let crate = currentCrate {
+            agent.show(.crate(crate), title: crate.name)
+        } else {
+            agent.show(.library, title: "Library")
+        }
+        // What was being typed belongs to the conversation it was typed in: "this crate" means that crate.
+        if agent.conversation != was {
+            drafts[was] = draft.text.isEmpty ? nil : draft.text
+            draft.text = drafts[agent.conversation] ?? ""
+        }
+    }
+
+    /// What the DJ has in front of them, for the agent and for what the agent bar offers.
+    /// - Parameter withTempos: include each deck's tempo as heard now. That changes many times a second
+    ///   while a deck plays, so a view that only wants suggestions leaves it out.
+    func agentContext(withTempos: Bool = false) -> AgentContext {
+        AgentContext(
+            view: title, crate: currentCrate, selection: selectedTracks,
+            decks: mixer.decks.map {
+                AgentContext.Deck(name: $0.id.name, track: $0.track, bpm: withTempos ? $0.bpm : nil, isPlaying: $0.isPlaying)
+            },
+            search: searchText, needsTagging: sidebar == .needsTagging)
+    }
+
+    /// Says something to the agent in the conversation on screen, with what is on screen sent along.
+    func ask(_ text: String) {
+        guard agent.phase == .ready else { return }
+        agent.send(text, context: agentContext(withTempos: true).preamble())
+        draft.didSend()
+    }
+
+    /// A suggestion clicked: a question is asked at once; anything else waits in the text field to be finished or sent.
+    func use(_ suggestion: AgentSuggestion) {
+        if suggestion.sendsAtOnce, agent.phase == .ready {
+            ask(suggestion.request)
+        } else {
+            draft.text = suggestion.request
+            draft.focus()
+        }
+    }
+
+    /// Selects tracks and offers what the agent bar would for them, as the track menu's "Ask the Agent" does.
+    func suggestions(for tracks: [Track]) -> [AgentSuggestion] {
+        var context = agentContext()
+        context.selection = tracks
+        return context.suggestions.filter { $0.request.contains("selected") }
+    }
+
+    /// Puts a library track on a sampler pad, and shows the sampler if it is hidden.
+    func sendToSampler(trackID: Int64, pad: Int) {
+        guard let track = try? store.track(id: trackID) else { return }
+        mixer.sampler.load(track, on: pad)
+        UserDefaults.standard.set(true, forKey: "sampler.shown")
+    }
+
+    /// Shows a track in the list and selects it, leaving the crate for the whole library only if it is not here.
+    func showInList(_ track: Track) {
+        if !tracks.contains(where: { $0.id == track.id }) {
+            if !searchText.isEmpty { searchText = "" }
+            if !tracks.contains(where: { $0.id == track.id }) { sidebar = .all }
+        }
+        guard tracks.contains(where: { $0.id == track.id }) else { return }
+        selection = [track.id]
+        browseMoves += 1
+    }
 
     // MARK: Library
 
@@ -387,6 +489,22 @@ final class AppModel {
         }
     }
 
+    /// Opens the cue editor for a track, putting it on a deck that is not playing if it is not on one.
+    func editCues(for track: Track) {
+        if let deck = mixer.decks.first(where: { $0.track?.id == track.id }) {
+            cueEditing = deck.id
+            return
+        }
+        let target = mixer.freeDeck
+        guard !mixer.deck(target).isPlaying else {
+            alert = "Both decks are playing. The cue editor needs a deck to play the track on: stop one first."
+            return
+        }
+        Task {
+            if await loadAndWait(track, on: target), mixer.deck(target).track?.id == track.id { cueEditing = target }
+        }
+    }
+
     func loadSelection(on deck: DeckID) {
         if let track = selectedTracks.first(where: { $0.source == .local }) { load(track, on: deck) }
     }
@@ -518,6 +636,7 @@ final class AppModel {
     func delete(_ crate: Crate) {
         do {
             try store.deleteCrate(id: crate.id)
+            agent.forget(.crate(crate))  // its conversation goes with it
         } catch {
             alert = error.localizedDescription
         }

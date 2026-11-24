@@ -33,6 +33,7 @@ public final class DeckEngine: @unchecked Sendable {
     public static let sliceFrames = 512
 
     public let decks: [Deck]
+    public let sampler: Sampler
     public let isOffline: Bool
     private let engine = AVAudioEngine()
     private let limiter: AVAudioUnitEffect
@@ -68,6 +69,9 @@ public final class DeckEngine: @unchecked Sendable {
         /// What the headphones hear: 0 is the cued decks only, 1 the master mix only, both in full at the middle.
         public var headphoneMix = 0.5
         public var headphoneLevel = 1.0
+        /// The sampler's level into the mix, and whether the headphones listen to it whatever that level is.
+        public var sampler = 1.0
+        public var samplerCue = false
     }
 
     /// The format everything inside the engine uses: master left and right, headphones left and right.
@@ -79,6 +83,7 @@ public final class DeckEngine: @unchecked Sendable {
         isOffline = offline
         format = Self.format(sampleRate: Self.sampleRate)
         decks = DeckID.allCases.map { Deck(id: $0, sampleRate: Self.sampleRate) }
+        sampler = Sampler(sampleRate: Self.sampleRate)
         limiter = AVAudioUnitEffect(audioComponentDescription: AudioComponentDescription(
             componentType: kAudioUnitType_Effect, componentSubType: kAudioUnitSubType_PeakLimiter,
             componentManufacturer: kAudioUnitManufacturer_Apple, componentFlags: 0, componentFlagsMask: 0))
@@ -102,6 +107,8 @@ public final class DeckEngine: @unchecked Sendable {
         engine.attach(limiter)
         engine.attach(clockNode)
         engine.connect(clockNode, to: engine.mainMixerNode, fromBus: 0, toBus: decks.count, format: format)
+        engine.attach(sampler.node)
+        engine.connect(sampler.node, to: engine.mainMixerNode, fromBus: 0, toBus: decks.count + 1, format: format)
         for deck in decks {
             engine.attach(deck.node)
             engine.attach(deck.keyLockUnit)
@@ -293,6 +300,9 @@ public final class DeckEngine: @unchecked Sendable {
             deck.set(.cue, to: mixer.cue[index] ? cueShare : 0)
             deck.set(.monitor, to: masterShare)
         }
+        // The sampler goes straight to the mix, past the crossfader.
+        sampler.setLevels(
+            master: max(0, mixer.sampler) * max(0, min(1, mixer.master)), cue: mixer.samplerCue ? cueShare : 0, monitor: masterShare)
         engine.mainMixerNode.outputVolume = 1
     }
 

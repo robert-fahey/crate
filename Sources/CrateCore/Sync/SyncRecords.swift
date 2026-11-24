@@ -86,6 +86,10 @@ public struct TrackRecord: Codable, Equatable, Sendable {
     public var detailsAt: Double
     /// Slot number (as text, for JSON) to seconds.
     public var cues: [String: Double]
+    /// Names of the cues that have one, and where the loops among them end, by slot number as above.
+    /// Absent from a Mac running an older Crate.
+    public var cueNames: [String: String]?
+    public var cueLoops: [String: Double]?
     public var cuesAt: Double
     public var grid: GridRecord?
     /// What the file is called on the Mac that sent this, to name a copy of it by.

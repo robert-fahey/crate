@@ -63,15 +63,20 @@ extension LibraryStore {
                 FROM tracks WHERE content_id = ? ORDER BY id LIMIT 1
                 """, [.text(key)]).first, let id = row.int("id")
             else { return nil }
-            var cues: [String: Double] = [:]
-            for (slot, position) in try self.cues(id: id) { cues[String(slot)] = position }
+            var cues: [String: Double] = [:], cueNames: [String: String] = [:], cueLoops: [String: Double] = [:]
+            for cue in try self.cuePoints(id: id) {
+                cues[String(cue.slot)] = cue.position
+                if !cue.name.isEmpty { cueNames[String(cue.slot)] = cue.name }
+                if let end = cue.loopEnd { cueLoops[String(cue.slot)] = end }
+            }
             return TrackRecord(
                 key: key, source: row.string("source") ?? "local", title: row.string("title") ?? "",
                 artist: row.string("artist") ?? "", album: row.string("album") ?? "", duration: row.double("duration") ?? 0,
                 format: row.string("format") ?? "", size: row.int("size") ?? 0, addedAt: row.double("added_at") ?? 0,
                 notes: row.string("notes") ?? "", bpm: row.double("bpm"), bpmSource: row.string("bpm_source"),
                 musicalKey: row.string("musical_key"), keySource: row.string("key_source"),
-                detailsAt: row.double("details_at") ?? 0, cues: cues, cuesAt: row.double("cues_at") ?? 0,
+                detailsAt: row.double("details_at") ?? 0, cues: cues, cueNames: cueNames, cueLoops: cueLoops,
+                cuesAt: row.double("cues_at") ?? 0,
                 grid: try gridRecord(id: id), fileName: row.string("path").map { ($0 as NSString).lastPathComponent })
         }
     }
@@ -321,7 +326,7 @@ extension LibraryStore {
                     .text(record.key), .double(record.detailsAt), .double(record.cuesAt),
                 ])
             let id = db.lastInsertRowID
-            try setCues(record.cues, id: id)
+            try setCues(record, id: id)
             if let grid = record.grid { try write(grid, id: id) }
             try reindex(id: id)
             return
@@ -348,7 +353,7 @@ extension LibraryStore {
             }
         }
         if record.cuesAt > (row.double("cues_at") ?? 0) {
-            try setCues(record.cues, id: id)
+            try setCues(record, id: id)
             try db.execute("UPDATE tracks SET cues_at = ? WHERE id = ?", [.double(record.cuesAt), .int(id)])
         }
         if let grid = record.grid {
@@ -363,11 +368,13 @@ extension LibraryStore {
         try reindex(id: id)
     }
 
-    private func setCues(_ cues: [String: Double], id: Int64) throws {
+    private func setCues(_ record: TrackRecord, id: Int64) throws {
         try db.execute("DELETE FROM cues WHERE track_id = ?", [.int(id)])
-        for (slot, position) in cues {
-            guard let slot = Int64(slot) else { continue }
-            try db.execute("INSERT OR REPLACE INTO cues (track_id, slot, position) VALUES (?, ?, ?)", [.int(id), .int(slot), .double(position)])
+        for (key, position) in record.cues {
+            guard let slot = Int64(key) else { continue }
+            try db.execute(
+                "INSERT OR REPLACE INTO cues (track_id, slot, position, name, loop_end) VALUES (?, ?, ?, ?, ?)",
+                [.int(id), .int(slot), .double(position), .text(record.cueNames?[key] ?? ""), .optional(record.cueLoops?[key])])
         }
     }
 

@@ -58,7 +58,7 @@ enum DebugDriver {
             // Wait for the agent to be ready, as a person would.
             for _ in 0..<100 where model.agent.phase != .ready { await sleep(0.1) }
             log("agent phase \(model.agent.phase)")
-            model.agent.send(argument)
+            model.ask(argument)
         case "await":
             for _ in 0..<600 where model.agent.phase == .working && model.agent.pendingCommand == nil { await sleep(0.1) }
             if let last = model.agent.messages.last {
@@ -148,6 +148,8 @@ enum DebugDriver {
             switch String(action[0]) {
             case "play": deck.togglePlay()
             case "cue": deck.cue()
+            case "cuedown": deck.cueDown()
+            case "cueup": deck.cueUp()
             case "sync": deck.isSynced.toggle()
             case "master": deck.toggleMaster()
             case "key": deck.keyLock.toggle()
@@ -163,6 +165,80 @@ enum DebugDriver {
             case "stop": deck.tapeStop()
             default: log("unknown deck action \(action[0])")
             }
+        case "mixplan":
+            // mixplan:<crate> opens the mix editor; mixplan:<crate>:suggest saves Crate's own transition for every pair
+            // that has none; :list prints them; :play plays the crate as a mix; :preview:<n> tries the nth transition;
+            // mixplan:close shuts the editor.
+            let parts = argument.split(separator: ":").map(String.init)
+            if parts.first == "close" { model.mixEditing = nil; return }
+            guard let crate = model.crates.first(where: { $0.name.caseInsensitiveCompare(parts.first ?? "") == .orderedSame }) else { return log("no such crate") }
+            let tracks = ((try? model.store.tracks(inCrate: crate.id)) ?? []).filter { $0.source == .local }
+            func steps() -> [MixStep] { (try? model.store.mixSteps(crate: crate.id)) ?? [] }
+            switch parts.count > 1 ? parts[1] : "open" {
+            case "suggest":
+                var added: [MixStep] = []
+                for (from, to) in zip(tracks, tracks.dropFirst()) where !steps().contains(where: { $0.from == from.id && $0.to == to.id }) {
+                    added.append(MixPlanner.suggest(from: MixSide(track: from, store: model.store), to: MixSide(track: to, store: model.store)))
+                }
+                try? model.store.setMixSteps(crate: crate.id, added)
+            case "clear": try? model.store.removeMixSteps(crate: crate.id)
+            case "play": await model.director.playMix(crate)
+            case "nearout":
+                // Winds the playing deck on to twelve seconds before the point where its saved transition starts.
+                if let deck = model.mixer.decks.first(where: \.isPlaying), let id = deck.track?.id, let step = steps().first(where: { $0.from == id }) {
+                    deck.seek(to: max(0, step.outAt - 12))
+                }
+            case "preview":
+                let saved = steps()
+                let index = parts.count > 2 ? Int(parts[2]) ?? 0 : 0
+                if tracks.indices.contains(index + 1), let step = saved.first(where: { $0.from == tracks[index].id && $0.to == tracks[index + 1].id }) {
+                    do { try await model.director.preview(step) } catch { log("preview refused: \(error.localizedDescription)") }
+                }
+            case "list": break
+            default: model.mixEditing = crate.id
+            }
+            let titles = Dictionary(tracks.map { ($0.id, $0.title) }, uniquingKeysWith: { first, _ in first })
+            log("mix of \(crate.name): " + zip(tracks, tracks.dropFirst()).map { from, to in
+                guard let step = steps().first(where: { $0.from == from.id && $0.to == to.id }) else { return "\(from.title.prefix(14)) → \(to.title.prefix(14)): -" }
+                return String(format: "%@ → %@: %@ %.0f beats out %.1f in %.1f (%@)", String((titles[step.from] ?? "").prefix(14)), String((titles[step.to] ?? "").prefix(14)), step.style.rawValue, step.beats, step.outAt, step.inAt, step.author.rawValue)
+            }.joined(separator: " | "))
+        case "cues":
+            // cues:A opens the cue editor on deck A; cues:close shuts it. cues:A:suggest fills the empty pads
+            // with Crate's suggestions; cues:A:list prints the pads.
+            let parts = argument.split(separator: ":").map(String.init)
+            if parts.first == "close" { model.cueEditing = nil; return }
+            let deck = model.mixer.deck(parts.first == "B" ? .b : .a)
+            switch parts.count > 1 ? parts[1] : "open" {
+            case "suggest":
+                deck.setCuePoints(CueSuggester.filling(Array(deck.cuePoints.values), with: deck.suggestedCues(), beat: 0.5))
+            case "clear": deck.setCuePoints([])
+            case "list": break
+            default: model.cueEditing = deck.id
+            }
+            log("cues on \(deck.id.name): " + deck.cuePoints.values.sorted { $0.slot < $1.slot }.map {
+                String(format: "%d %@ %.2f%@", $0.slot, $0.name.isEmpty ? "-" : $0.name, $0.position, $0.loopEnd.map { String(format: " loop to %.2f", $0) } ?? "")
+            }.joined(separator: " | "))
+        case "sampler":
+            // sampler:show, sampler:hide, sampler:load:<pad>:<row>, sampler:take:<pad>:<A|B>, sampler:hit:<pad>,
+            // sampler:loop:<pad>, sampler:stop, sampler:list. Pads count from 1.
+            let parts = argument.split(separator: ":").map(String.init)
+            let sampler = model.mixer.sampler!
+            let pad = (parts.count > 1 ? Int(parts[1]) ?? 1 : 1) - 1
+            switch parts.first {
+            case "show": UserDefaults.standard.set(true, forKey: "sampler.shown")
+            case "hide": UserDefaults.standard.set(false, forKey: "sampler.shown")
+            case "load":
+                if parts.count > 2, let row = Int(parts[2]), model.tracks.indices.contains(row) { sampler.load(model.tracks[row], on: pad) }
+                for _ in 0..<100 where sampler.pads.indices.contains(pad) && sampler.pads[pad].isLoading { await sleep(0.1) }
+            case "take": sampler.capture(from: model.mixer.deck(parts.last == "B" ? .b : .a), on: pad)
+            case "hit": sampler.hit(pad)
+            case "loop": sampler.setLoops(!sampler.pads[pad].loops, on: pad)
+            case "stop": sampler.stop()
+            default: break
+            }
+            log("sampler: " + sampler.pads.filter(\.isLoaded).map {
+                String(format: "%d %@ %.2fs%@%@", $0.id + 1, $0.name, $0.seconds, $0.loops ? " loop" : "", $0.isPlaying ? String(format: " playing %.0f%%", $0.progress * 100) : "")
+            }.joined(separator: " | ") + (sampler.problem.map { " | problem: \($0)" } ?? ""))
         case "grid":
             // grid:A opens the grid editor on deck A; grid:close shuts it.
             model.gridEditing = argument == "close" ? nil : (argument == "B" ? .b : .a)
@@ -225,6 +301,15 @@ enum DebugDriver {
             }
         case "large":
             UserDefaults.standard.set(argument != "off", forKey: "decks.large")
+        case "offers":
+            // What the agent bar is offering, and what its text field says. offers:1 clicks the second offer.
+            let context = model.agentContext()
+            if let index = Int(argument), context.suggestions.indices.contains(index) { model.use(context.suggestions[index]) }
+            log("conversation “\(model.agent.title)” | offers: \(context.suggestions.map { $0.label + ($0.sendsAtOnce ? " (asks)" : " (fills)") }.joined(separator: ", ")) | field: \(model.draft.text.isEmpty ? context.placeholder : "typed “\(model.draft.text)”")")
+        case "select":
+            // select:0,3 selects those rows of the list; select: clears the selection.
+            let rows = argument.split(separator: ",").compactMap { Int($0) }.filter { model.tracks.indices.contains($0) }
+            model.selection = Set(rows.map { model.tracks[$0].id })
         case "history":
             log("history: \(model.agent.messages.count) messages; requests \(model.agent.pastRequests); last: \(model.agent.messages.last?.text.prefix(80) ?? "-")")
         case "volume":
@@ -267,6 +352,44 @@ enum DebugDriver {
                 + model.tracks.prefix(14).map { "\($0.bpm.map { String(format: "%.1f", $0) } ?? "-") \($0.key ?? "-")" }.joined(separator: " | "))
         case "search":
             model.searchText = argument
+        case "mouse":
+            // mouse:259,283:down, :move, :up, or :double — the mouse at a point measured from the top left corner
+            // of the window (of the sheet, when one is up), sent to it as a real click would be. For buttons
+            // that act while held and for things that are dragged. Set the window's size first so the point is
+            // where it is expected to be.
+            let parts = argument.split(separator: ":").map(String.init)
+            let at = parts.first?.split(separator: ",").compactMap { Double($0) } ?? []
+            guard parts.count == 2, at.count == 2,
+                  let main = NSApp.windows.first(where: { $0.isVisible && $0.sheetParent == nil && $0.contentView != nil })
+            else { return log("mouse:<x>,<y>:<down|move|up|double>") }
+            let window = main.attachedSheet ?? main
+            // A window that is not in front takes its first click only to come forward.
+            if !main.isKeyWindow, !window.isKeyWindow {
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+                await sleep(0.4)
+            }
+            func post(_ type: NSEvent.EventType, clicks: Int = 1) {
+                if let event = NSEvent.mouseEvent(
+                    with: type, location: NSPoint(x: at[0], y: window.frame.height - at[1]), modifierFlags: [],
+                    timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber, context: nil,
+                    eventNumber: 0, clickCount: clicks, pressure: type == .leftMouseUp ? 0 : 1) {
+                    // Through the app's queue, as the window server delivers it: controls that follow the mouse
+                    // themselves (every SwiftUI button) pick the release up from there.
+                    NSApp.postEvent(event, atStart: false)
+                }
+            }
+            switch parts[1] {
+            case "down": post(.leftMouseDown)
+            case "move": post(.leftMouseDragged)
+            case "up": post(.leftMouseUp)
+            case "double":
+                post(.leftMouseDown)
+                post(.leftMouseUp)
+                post(.leftMouseDown, clicks: 2)
+                post(.leftMouseUp, clicks: 2)
+            default: log("mouse:<x>,<y>:<down|move|up|double>")
+            }
         case "settings":
             // settings:audio opens the Settings window on that tab.
             UserDefaults.standard.set(argument, forKey: "settings.tab")

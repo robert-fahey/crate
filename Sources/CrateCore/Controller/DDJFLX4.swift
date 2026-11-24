@@ -41,6 +41,8 @@ public enum ControlEvent: Equatable, Sendable {
     case hotCue(DeckID, Int)
     case clearHotCue(DeckID, Int)
     case beatLoop(DeckID, beats: Double)
+    /// A sampler pad, 0...7, hit; with SHIFT it stops the pad instead.
+    case sample(Int, stop: Bool)
 
     /// The browse knob: rows down the track list, negative for up.
     case browse(Int)
@@ -53,7 +55,7 @@ public enum ControlEvent: Equatable, Sendable {
 }
 
 public enum PadMode: Equatable, Sendable {
-    case hotCue, beatLoop, beatJump, other
+    case hotCue, beatLoop, beatJump, sampler, other
 }
 
 /// A light on the controller.
@@ -63,6 +65,8 @@ public enum ControlLight: Hashable, Sendable {
     case loaded(DeckID)
     case hotCue(DeckID, Int)
     case beatLoop(DeckID, Int)
+    /// A pad in SAMPLER mode, 0...7, on either deck's side.
+    case sample(DeckID, Int)
     case padMode(DeckID, PadMode)
     case effect(DeckID)
 }
@@ -129,7 +133,8 @@ public enum DDJFLX4 {
                 case 0x1B: return .padMode(deck, .hotCue)
                 case 0x6D: return .padMode(deck, .beatLoop)
                 case 0x20: return .padMode(deck, .beatJump)
-                case 0x69, 0x1E, 0x6B, 0x22, 0x6F: return .padMode(deck, .other)
+                case 0x22: return .padMode(deck, .sampler)
+                case 0x69, 0x1E, 0x6B, 0x6F: return .padMode(deck, .other)
                 default: return nil
                 }
             case 4, 5:
@@ -158,6 +163,8 @@ public enum DDJFLX4 {
                 case 0x20...0x27:
                     let size = Double(1 << (Int(number - 0x20) / 2))
                     return .jump(deck, beats: number % 2 == 0 ? -size : size)
+                // Both sides' pads play the same eight samples.
+                case 0x30...0x37: return .sample(Int(number - 0x30), stop: shifted)
                 default: return nil
                 }
             default:
@@ -230,12 +237,14 @@ public enum DDJFLX4 {
         case .loaded(let deck): return [0x9F, UInt8(deck.rawValue), value]
         case .hotCue(let deck, let slot): return pad(deck, UInt8(max(1, min(8, slot)) - 1))
         case .beatLoop(let deck, let index): return pad(deck, 0x60 + UInt8(max(0, min(7, index))))
+        case .sample(let deck, let index): return pad(deck, 0x30 + UInt8(max(0, min(7, index))))
         case .effect(let deck): return [deck == .a ? 0x94 : 0x95, 0x47, value]
         case .padMode(let deck, let mode):
             switch mode {
             case .hotCue: return deckNote(deck, 0x1B)
             case .beatLoop: return deckNote(deck, 0x6D)
             case .beatJump: return deckNote(deck, 0x20)
+            case .sampler: return deckNote(deck, 0x22)
             case .other: return []
             }
         }

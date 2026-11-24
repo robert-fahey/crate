@@ -88,8 +88,16 @@ final class AgentSession {
     }
 
     private(set) var phase: Phase = .starting
-    private(set) var messages: [ChatMessage] = []
-    /// How many messages of the conversation are kept between launches.
+    /// The conversation on screen. It follows the sidebar: a crate's own while that crate is shown, the library's otherwise.
+    private(set) var conversation = ConversationID.library
+    /// What the conversation on screen is called: the crate's name, or "Library".
+    private(set) var title = "Library"
+    /// The conversation a reply is being written into. The DJ may have moved on to another one meanwhile.
+    private(set) var working: ConversationID?
+    /// Every conversation looked at since launch, each read from the library the first time it is shown.
+    private var histories: [ConversationID: [ChatMessage]] = [:]
+    private var titles: [ConversationID: String] = [.library: "Library"]
+    /// How many messages of a conversation are kept between launches.
     static let historyLimit = 400
     private(set) var models: [AgentModel] = []
     private(set) var accountEmail: String?
@@ -105,29 +113,78 @@ final class AgentSession {
     @ObservationIgnored private var commandDecision: CheckedContinuation<Bool, Never>?
     @ObservationIgnored private var commandWaiters: [(CommandRequest, CheckedContinuation<Bool, Never>)] = []
     @ObservationIgnored private var log = ""
+    /// The conversation the agent process is holding: the one it remembers. It holds one at a time, and is
+    /// handed another only when something is said in it, so looking through crates costs nothing.
+    @ObservationIgnored private var live: ConversationID?
+    /// The conversation the agent process has been asked to take up and has not yet confirmed.
+    @ObservationIgnored private var switching: ConversationID?
 
     init(store: LibraryStore, registry: ToolRegistry) {
         self.store = store
         self.registry = registry
-        loadHistory()
+        histories[.library] = savedHistory(of: .library)
+    }
+
+    // MARK: Conversations
+
+    /// The messages of the conversation on screen.
+    var messages: [ChatMessage] { histories[conversation] ?? [] }
+
+    /// A reply is being written into the conversation on screen.
+    var isWorkingHere: Bool { phase == .working && working == conversation }
+
+    /// The name of the other conversation the agent is busy in, if it is busy in one.
+    var busyElsewhere: String? {
+        guard phase == .working, let working, working != conversation else { return nil }
+        return titles[working] ?? "another conversation"
+    }
+
+    /// What the agent is doing this moment, in a few words; nil when it is doing nothing.
+    var activity: String? {
+        guard phase == .working, let working, let reply = histories[working]?.last, reply.role == .assistant else { return nil }
+        switch reply.parts.last {
+        case .tool(let tool) where tool.state == .running: return tool.server.map { "\($0): " + tool.summary } ?? tool.summary
+        case .text: return "Writing a reply"
+        default: return "Thinking"
+        }
+    }
+
+    /// Puts a conversation on screen. Nothing is sent to the agent until something is said in it.
+    func show(_ id: ConversationID, title: String) {
+        if titles[id] != title { titles[id] = title }
+        if self.title != title { self.title = title }
+        guard id != conversation else { return }
+        if histories[id] == nil { histories[id] = savedHistory(of: id) }
+        conversation = id
+    }
+
+    /// Forgets a conversation altogether, as when its crate is deleted.
+    func forget(_ id: ConversationID) {
+        guard id != working, !id.isLibrary else { return }
+        histories[id] = nil
+        titles[id] = nil
+        store.setSetting(id.historySetting, nil)
+        store.setSetting(id.agentSetting, nil)
+        if live == id { live = nil }
     }
 
     // MARK: History
 
-    /// The conversation is kept with the library, so it is still there after a restart.
-    private func loadHistory() {
-        guard let saved = store.setting("agent.history")?.data(using: .utf8),
+    /// Conversations are kept with the library, so they are still there after a restart.
+    private func savedHistory(of id: ConversationID) -> [ChatMessage] {
+        guard let saved = store.setting(id.historySetting)?.data(using: .utf8),
               var history = try? JSONDecoder().decode([ChatMessage].self, from: saved)
-        else { return }
+        else { return [] }
         // Anything still "running" when the app last closed never finished.
         for index in history.indices { history[index].failRunningTools() }
-        messages = history.filter { !$0.isEmpty }
+        return history.filter { !$0.isEmpty }
     }
 
-    private func saveHistory() {
-        let recent = messages.suffix(Self.historyLimit).filter { !$0.isEmpty }
+    private func saveHistory(of id: ConversationID) {
+        let recent = (histories[id] ?? []).suffix(Self.historyLimit).filter { !$0.isEmpty }
+        if recent.isEmpty { return store.setSetting(id.historySetting, nil) }
         if let data = try? JSONEncoder().encode(Array(recent)), let text = String(data: data, encoding: .utf8) {
-            store.setSetting("agent.history", text)
+            store.setSetting(id.historySetting, text)
         }
     }
 
@@ -138,11 +195,11 @@ final class AgentSession {
             .filter { seen.insert($0).inserted }.reversed()
     }
 
-    /// Empties the history on screen. The agent's own memory of the conversation is separate; "New Conversation" resets that.
+    /// Empties the history on screen. The agent's own memory of the conversation is separate; "Start Over" resets that.
     func clearHistory() {
-        guard phase != .working else { return }
-        messages.removeAll()
-        saveHistory()
+        guard !isWorkingHere else { return }
+        histories[conversation] = []
+        saveHistory(of: conversation)
     }
 
     var selectedModel: String {
@@ -150,7 +207,8 @@ final class AgentSession {
         get { AgentSessionConfig.resolveModel(saved: store.setting("agent.model"), available: models.map(\.id)) }
         set {
             store.setSetting("agent.model", newValue)
-            store.setSetting("agent.id", nil)  // a different model starts a fresh conversation
+            store.removeSettings(prefix: "agent.id")  // a different model starts every conversation afresh
+            live = nil
             if phase == .ready { startSession() }
         }
     }
@@ -232,18 +290,22 @@ final class AgentSession {
 
     func signOut() {
         bridge?.logout()
-        store.setSetting("agent.id", nil)
-        messages.removeAll()
+        store.removeSettings(prefix: "agent.id")
+        live = nil
+        for id in histories.keys { histories[id] = [] }
     }
 
+    /// Starts the conversation on screen again from nothing, as far as the agent's memory goes.
     func newConversation() {
         guard phase == .ready else { return }
-        store.setSetting("agent.id", nil)
+        store.setSetting(conversation.agentSetting, nil)
         // The history stays on screen; a line marks where the agent's memory starts again.
-        notice("New conversation: the agent no longer remembers what is above this line.")
-        saveHistory()
+        notice(Self.forgotten, in: conversation)
+        saveHistory(of: conversation)
         startSession()
     }
+
+    private static let forgotten = "Starting over: the agent no longer remembers what is above this line."
 
     /// Restarts the session so changed settings (library folders, MCP servers) take effect.
     func reloadSession() {
@@ -258,31 +320,55 @@ final class AgentSession {
         return folder.path
     }
 
+    /// Readies the agent with the conversation on screen, at launch and after a change of settings.
     private func startSession() {
-        guard let bridge else { return }
+        phase = .connecting
+        hand(conversation)
+    }
+
+    /// Has the agent process take up a conversation: resume it if it has been spoken in before, begin it if not.
+    /// A request sent straight after this waits in the agent process until the conversation is ready.
+    @discardableResult
+    private func hand(_ id: ConversationID) -> Bool {
+        guard let bridge else { return false }
         do {
             let servers = (try? Self.parseMCPServers(mcpServersText)) ?? [:]
             let folders = ((try? store.folders()) ?? []).map(\.path).filter { FileManager.default.fileExists(atPath: $0) }
             let model = selectedModel
-            phase = .connecting
+            switching = id
             bridge.startSession(AgentSessionConfig(
                 model: model, workingDirectory: try workspace(), libraryFolders: folders, mcpServers: servers,
-                resumeID: store.setting("agent.id")))
+                resumeID: store.setting(id.agentSetting)))
+            return true
         } catch {
+            switching = nil
             phase = .unavailable("Could not prepare the agent's working folder: \(error.localizedDescription)")
+            return false
         }
     }
 
     // MARK: Conversation
 
-    func send(_ text: String) {
+    /// Says something in the conversation on screen.
+    /// - Parameter context: what the DJ is looking at, for the agent alone; it is not shown or kept.
+    func send(_ text: String, context: String = "") {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard phase == .ready, !trimmed.isEmpty, let bridge else { return }
-        messages.append(ChatMessage(role: .user, text: trimmed))
-        saveHistory()  // so the request is kept even if the app quits before the reply
-        messages.append(ChatMessage(role: .assistant, text: ""))
+        let id = conversation
+        histories[id, default: []].append(ChatMessage(role: .user, text: trimmed))
+        saveHistory(of: id)  // so the request is kept even if the app quits before the reply
+        guard begin(in: id) else { return }
+        bridge.chat(context + trimmed)
+    }
+
+    /// Opens a reply in a conversation, handing the conversation to the agent process first if it holds another.
+    /// False if the agent could not be readied.
+    private func begin(in id: ConversationID) -> Bool {
+        if live != id, !hand(id) { return false }
+        histories[id, default: []].append(ChatMessage(role: .assistant, text: ""))
+        working = id
         phase = .working
-        bridge.chat(trimmed)
+        return true
     }
 
     func cancel() {
@@ -292,24 +378,40 @@ final class AgentSession {
     }
 
     private func updateReply(_ change: (inout ChatMessage) -> Void) {
-        guard let last = messages.indices.last, messages[last].role == .assistant else { return }
-        change(&messages[last])
+        guard let working, let last = histories[working]?.indices.last, histories[working]?[last].role == .assistant else { return }
+        change(&histories[working]![last])
     }
 
     /// Sends a request that the app itself raised (the auto DJ asking for the next mix).
     /// It shows as a note, not as something the user typed. Returns false if the agent is busy or not available.
+    /// It goes into the conversation the agent already holds (the one last spoken in), wherever the DJ is looking.
     @discardableResult
     func sendAutomatic(_ text: String, label: String) -> Bool {
         guard phase == .ready, let bridge else { return false }
-        notice(label)
-        messages.append(ChatMessage(role: .assistant, text: ""))
-        phase = .working
+        let id = live ?? conversation
+        notice(label, in: id)
+        guard begin(in: id) else { return false }
         bridge.chat(text)
         return true
     }
 
-    private func notice(_ text: String) {
-        messages.append(ChatMessage(role: .notice, text: text))
+    /// A line of the app's own in a conversation: by default the one being worked in, or else the one on screen.
+    private func notice(_ text: String, in id: ConversationID? = nil) {
+        histories[id ?? working ?? conversation, default: []].append(ChatMessage(role: .notice, text: text))
+    }
+
+    /// Notes in a conversation that the agent has lost its memory of what is above. The note goes above a
+    /// request that is waiting for its reply, since that request is the first thing the agent will remember.
+    private func noteMemoryLost(in id: ConversationID) {
+        var history = histories[id] ?? []
+        var end = history.count
+        if working == id, phase == .working {
+            if end > 0, history[end - 1].role == .assistant { end -= 1 }
+            if end > 0, history[end - 1].role != .assistant { end -= 1 }
+        }
+        guard end > 0, history[end - 1].role != .notice else { return }
+        history.insert(ChatMessage(role: .notice, text: Self.forgotten), at: end)
+        histories[id] = history
     }
 
     private func handle(_ event: AgentEvent) {
@@ -336,23 +438,27 @@ final class AgentSession {
             startSession()
 
         case .sessionStarted(let agentID, let resumed):
-            store.setSetting("agent.id", agentID)
-            // A session that could not be resumed after a restart has lost its memory of the history on screen.
-            if !resumed, messages.last.map({ $0.role != .notice }) == true {
-                notice("New conversation: the agent no longer remembers what is above this line.")
-            }
-            phase = .ready
+            let id = switching ?? conversation
+            switching = nil
+            live = id
+            store.setSetting(id.agentSetting, agentID)
+            // A conversation that could not be resumed has lost the agent's memory of the history on screen.
+            if !resumed { noteMemoryLost(in: id) }
+            if phase == .connecting { phase = .ready }
 
         case .sessionReplaced(let agentID):
-            store.setSetting("agent.id", agentID)
+            let id = working ?? live ?? conversation
+            store.setSetting(id.agentSetting, agentID)
             // The reply that is about to arrive is written into the last message, so the note goes above it.
             let note = ChatMessage(
                 role: .notice, text: "The earlier conversation was cut off mid-reply and could not be continued, so this is a new one.")
-            if let last = messages.indices.last, messages[last].role == .assistant {
-                messages.insert(note, at: last)
+            var history = histories[id] ?? []
+            if let last = history.indices.last, history[last].role == .assistant {
+                history.insert(note, at: last)
             } else {
-                messages.append(note)
+                history.append(note)
             }
+            histories[id] = history
 
         case .textDelta(let text):
             updateReply { $0.append(text: text) }
@@ -376,10 +482,13 @@ final class AgentSession {
             } else if status == "error" {
                 notice("The agent hit a problem: \(error ?? "unknown error").")
             }
-            if let last = messages.last, last.role == .assistant, last.isEmpty {
-                messages.removeLast()
+            if let working {
+                if let last = histories[working]?.last, last.role == .assistant, last.isEmpty {
+                    histories[working]?.removeLast()
+                }
+                saveHistory(of: working)
             }
-            saveHistory()
+            working = nil
             if phase == .working { phase = .ready }
 
         case .error(let code, let message):
@@ -394,14 +503,30 @@ final class AgentSession {
                     phase = .unavailable(message)
                 }
             case .working:
-                notice(message)
+                // The conversation could not be taken up, so the agent process holds none.
+                if switching != nil {
+                    switching = nil
+                    live = nil
+                }
+                if let working {
+                    if let last = histories[working]?.last, last.role == .assistant, last.isEmpty {
+                        histories[working]?.removeLast()
+                    }
+                    notice(message, in: working)
+                    saveHistory(of: working)
+                }
+                working = nil
                 phase = .ready
             default:
-                notice(message)
+                // The request that was waiting behind a conversation that could not be taken up; that has been reported.
+                if code != "no_session" { notice(message) }
             }
 
         case .exited(let expected):
             bridge = nil
+            live = nil
+            switching = nil
+            working = nil
             resolveCommand(approved: false)
             if !expected {
                 let detail = log.split(separator: "\n").last.map(String.init) ?? "no details"

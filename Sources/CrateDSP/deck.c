@@ -325,6 +325,16 @@ static void schedule(CrateDeck *deck, const CrateCommand *command) {
     deck->pendingCount++;
 }
 
+/// Drops a start that is still waiting for its frame: the jump to the beat and the motor command with it.
+static void cancelWaitingStart(CrateDeck *deck) {
+    int kept = 0;
+    for (int i = 0; i < deck->pendingCount; i++) {
+        int32_t type = deck->pending[i].type;
+        if (type != CrateCmdMotor && type != CrateCmdSeek) deck->pending[kept++] = deck->pending[i];
+    }
+    deck->pendingCount = kept;
+}
+
 static inline double sampleAt(const float *data, int64_t frames, int64_t index) {
     return index >= 0 && index < frames ? (double)data[index] : 0.0;
 }
@@ -575,7 +585,14 @@ void crate_deck_render(CrateDeck *deck, float *left, float *right, float *phones
     uint32_t write = atomic_load_explicit(&deck->queueWrite, memory_order_acquire);
     while (read != write) {
         const CrateCommand *command = &deck->queue[read & (QUEUE_SIZE - 1)];
-        if (command->atFrame <= deck->frame) apply(deck, command); else schedule(deck, command);
+        if (command->atFrame <= deck->frame) {
+            // Stopping or starting the deck now overrules a start that was waiting for the master's beat.
+            // Otherwise a deck stopped in that moment (Cue tapped and let go) would start by itself.
+            if (command->type == CrateCmdMotor) cancelWaitingStart(deck);
+            apply(deck, command);
+        } else {
+            schedule(deck, command);
+        }
         read++;
     }
     atomic_store_explicit(&deck->queueRead, read, memory_order_release);

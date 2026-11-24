@@ -5,6 +5,8 @@
 //
 //   /tool <name> <json args>   call one host tool and print what it returned
 //   /slow                      stream text slowly until cancelled
+//   /context                   print what the app said the DJ is looking at
+//   /say <text>                reply with that text, e.g. to try a track link
 //   anything else              run library_search with the text, if that tool exists
 
 import type { Json } from "./protocol.js";
@@ -38,8 +40,14 @@ function makeAgent(id: string, options: PortAgentOptions): PortAgent {
       };
 
       const done = (async (): Promise<PortRunResult> => {
-        const trimmed = text.trim();
-        if (trimmed === "/slow") {
+        // The app puts what the DJ is looking at in front of each request.
+        const [, context = "", typed = text] = /^<crate-context>\n([\s\S]*?)\n<\/crate-context>\s*([\s\S]*)$/.exec(text) ?? [];
+        const trimmed = typed.trim();
+        if (trimmed === "/context") {
+            await say(context || "(no context was sent)");
+        } else if (trimmed.startsWith("/say ")) {
+            await say(trimmed.slice(5));
+        } else if (trimmed === "/slow") {
           for (let i = 0; i < 2000 && !cancelled; i++) {
             onEvent({ type: "text", text: `tick ${i} ` });
             await sleep(20);

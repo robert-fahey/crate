@@ -69,6 +69,30 @@ public struct Crate: Identifiable, Equatable, Sendable {
     public var keepHere: Bool = false
 }
 
+/// A hot cue: a place in a track kept under one of eight numbered pads. With an end it is a saved
+/// loop: its pad goes there and goes round.
+public struct CuePoint: Identifiable, Equatable, Sendable {
+    public static let slots = 1...8
+
+    public var slot: Int
+    /// In seconds from the start of the track.
+    public var position: Double
+    /// What the DJ (or the agent) called it: "Drop", "Break". Empty for a cue set by hitting a pad.
+    public var name: String
+    /// Where the loop ends, in seconds, for a saved loop; nil for a plain cue.
+    public var loopEnd: Double?
+
+    public var id: Int { slot }
+    public var isLoop: Bool { loopEnd != nil }
+
+    public init(slot: Int, position: Double, name: String = "", loopEnd: Double? = nil) {
+        self.slot = slot
+        self.position = position
+        self.name = name
+        self.loopEnd = loopEnd.flatMap { $0 > position ? $0 : nil }
+    }
+}
+
 public struct LibraryFolder: Identifiable, Equatable, Sendable {
     public var id: Int64
     public var path: String

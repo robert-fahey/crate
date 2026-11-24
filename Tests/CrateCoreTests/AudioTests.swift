@@ -177,6 +177,31 @@ final class DeckEngineTests: XCTestCase {
         XCTAssertGreaterThan(rendered[onlyB[0]..<(onlyB[0] + 40)].map(abs).max() ?? 0, 0.6, "the click keeps its level")
     }
 
+    func testStoppingADeckCancelsAStartThatWasWaitingForItsBeat() throws {
+        let engine = try engine()
+        let deck = engine.deck(.a)
+        deck.load(TrackAudio(left: Probe.clicks(at: [0.5], seconds: 2), sampleRate: Probe.rate))
+        _ = try engine.render(frames: 1000)
+        // A synced deck starts a moment ahead, on the master's beat. Cue tapped and let go inside that moment
+        // stops the deck and puts it back on its cue point, and it must stay there.
+        let base = deck.state().frame
+        deck.seek(to: 1, at: base + 3000)
+        deck.play(at: base + 3000)
+        deck.pause()
+        deck.seek(to: 0.25)
+        let rendered = try engine.render(frames: 12_000)
+        XCTAssertFalse(deck.state().isPlaying, "the start that was waiting does not happen")
+        XCTAssertEqual(deck.state().position, 0.25, accuracy: 0.001, "nor does its jump")
+        XCTAssertEqual(rendered.left.map(abs).max() ?? 0, 0, accuracy: 0.0001)
+
+        // A start asked for afterwards still lands on its frame.
+        let next = deck.state().frame
+        deck.play(at: next + 2000)
+        _ = try engine.render(frames: 4000)
+        XCTAssertTrue(deck.state().isPlaying)
+        XCTAssertEqual(deck.state().position, 0.25 + 2000 / Probe.rate, accuracy: 0.002)
+    }
+
     func testALoopRepeatsToTheSample() throws {
         let engine = try engine()
         let deck = engine.deck(.a)
@@ -852,6 +877,11 @@ final class ControllerTests: XCTestCase {
         XCTAssertEqual(
             events([[0x97, 0x00, 0x7F], [0x99, 0x07, 0x7F], [0x98, 0x02, 0x7F], [0x97, 0x62, 0x7F], [0x99, 0x20, 0x7F], [0x99, 0x25, 0x7F]]),
             [.hotCue(.a, 1), .hotCue(.b, 8), .clearHotCue(.a, 3), .beatLoop(.a, beats: 1), .jump(.b, beats: -1), .jump(.b, beats: 4)])
+        // SAMPLER mode: either side's pads play the same eight samples, and with SHIFT a pad stops.
+        XCTAssertEqual(
+            events([[0x90, 0x22, 0x7F], [0x97, 0x30, 0x7F], [0x99, 0x37, 0x7F], [0x9A, 0x31, 0x7F]]),
+            [.padMode(.a, .sampler), .sample(0, stop: false), .sample(7, stop: false), .sample(1, stop: true)])
+        XCTAssertFalse(DDJFLX4.message(for: .sample(.b, 2), on: true).isEmpty)
         XCTAssertEqual(
             events([[0x90, 0x10, 0x7F], [0x90, 0x10, 0x00], [0x90, 0x11, 0x7F], [0x91, 0x4D, 0x7F], [0x91, 0x51, 0x7F], [0x91, 0x53, 0x7F]]),
             [.loopIn(.a, down: true), .loopIn(.a, down: false), .loopOut(.a), .reloop(.b), .loopHalve(.b), .loopDouble(.b)])
@@ -883,5 +913,134 @@ final class ControllerTests: XCTestCase {
         XCTAssertEqual(DDJFLX4.meter(.b, level: 0.5), [0xB1, 0x02, 64])
         XCTAssertTrue(DDJFLX4.isThisController("DDJ-FLX4"))
         XCTAssertFalse(DDJFLX4.isThisController("IAC Driver Bus 1"))
+    }
+}
+
+final class SamplerTests: XCTestCase {
+    private func level(_ samples: ArraySlice<Float>) -> Float { samples.map(abs).max() ?? 0 }
+    private func clip(_ samples: [Float], rate: Double = Probe.rate) -> SampleClip {
+        SampleClip(audio: TrackAudio(left: samples, sampleRate: rate))
+    }
+
+    func testAPadPlaysItsAudioFromTheStartWhenHitAndStopsAtTheEnd() throws {
+        let engine = try DeckEngine(offline: true)
+        let sampler = engine.sampler
+        sampler.load(clip(Probe.clicks(at: [0, 0.25], seconds: 0.5)), on: 2)
+        XCTAssertEqual(level(try engine.render(frames: 4000).left[...]), 0, accuracy: 1e-6, "a loaded pad is silent until it is hit")
+
+        sampler.trigger(2)
+        let first = try engine.render(seconds: 0.4)
+        let onsets = Probe.onsets(in: first.left, threshold: 0.02)
+        XCTAssertEqual(onsets.count, 2)
+        XCTAssertEqual(Double(onsets[1] - onsets[0]) / Probe.rate, 0.25, accuracy: 0.0005)
+        XCTAssertTrue(sampler.state()[2].isPlaying)
+        XCTAssertEqual(sampler.state()[2].progress, 0.8, accuracy: 0.05)
+        XCTAssertFalse(sampler.state()[0].isPlaying)
+
+        _ = try engine.render(seconds: 0.3)
+        XCTAssertFalse(sampler.state()[2].isPlaying, "it stops by itself at the end")
+
+        // Hit twice, it starts again each time.
+        sampler.trigger(2)
+        _ = try engine.render(seconds: 0.1)
+        sampler.trigger(2)
+        let again = Probe.onsets(in: try engine.render(seconds: 0.2).left, threshold: 0.02)
+        XCTAssertEqual(again.count, 1, "the second hit starts from the click at the top again")
+    }
+
+    func testALoopingPadGoesRoundUntilStoppedAndFadesRatherThanClicks() throws {
+        let engine = try DeckEngine(offline: true)
+        let sampler = engine.sampler
+        sampler.load(clip(Probe.sine(440, seconds: 0.5)), on: 0)
+        sampler.set(loops: true, on: 0)
+        sampler.trigger(0)
+        _ = try engine.render(seconds: 1.3)
+        XCTAssertTrue(sampler.state()[0].isPlaying, "still going after its length twice over")
+        let round = try engine.render(seconds: 0.5)
+        XCTAssertEqual(Probe.frequency(of: round.left[...]), 440, accuracy: 2)
+        XCTAssertEqual(level(round.left[...]), 0.5, accuracy: 0.02)
+
+        sampler.stop(0)
+        let tail = try engine.render(seconds: 0.2).left
+        XCTAssertFalse(sampler.state()[0].isPlaying)
+        XCTAssertEqual(level(tail[2000...]), 0, accuracy: 1e-6, "silent a few milliseconds after stopping")
+        // A fade, not a cut: no step between neighbouring samples bigger than the sine itself makes.
+        let steps = zip(tail, tail.dropFirst()).map { abs($1 - $0) }
+        XCTAssertLessThan(steps.max() ?? 1, 0.06)
+    }
+
+    func testTheSamplerHasItsOwnLevelAndItsOwnWayToTheHeadphones() throws {
+        let engine = try DeckEngine(offline: true)
+        let sampler = engine.sampler
+        sampler.load(clip(Probe.sine(880, seconds: 30)), on: 7)
+        sampler.trigger(7)
+        var settings = engine.settings
+        settings.crossfader = -1
+        settings.headphoneMix = 0
+        engine.settings = settings
+        _ = try engine.render(seconds: 0.2)
+        var out = try engine.renderBoth(seconds: 0.5)
+        XCTAssertEqual(level(out.master.left[...]), 0.5, accuracy: 0.02, "the crossfader does not touch the sampler")
+        XCTAssertEqual(level(out.phones.left[...]), 0, accuracy: 0.001, "not in the headphones until cued")
+
+        settings.sampler = 0.5
+        settings.master = 0.5
+        engine.settings = settings
+        _ = try engine.render(seconds: 0.2)
+        XCTAssertEqual(level(try engine.render(seconds: 0.5).left[...]), 0.125, accuracy: 0.01, "its own level, then the master volume")
+
+        // Turned right down and cued: the headphones hear it and the room does not.
+        settings.sampler = 0
+        settings.samplerCue = true
+        engine.settings = settings
+        _ = try engine.render(seconds: 0.2)
+        out = try engine.renderBoth(seconds: 0.5)
+        XCTAssertEqual(level(out.master.left[...]), 0, accuracy: 0.001)
+        XCTAssertEqual(level(out.phones.left[...]), 0.5, accuracy: 0.02)
+        XCTAssertEqual(Probe.frequency(of: out.phones.left[...]), 880, accuracy: 4)
+    }
+
+    func testAPadPlaysAStretchOfATrackAtTheRightPitchWhateverItsSampleRate() throws {
+        let engine = try DeckEngine(offline: true)
+        let sampler = engine.sampler
+        // Half the engine's rate: played sample for sample it would sound an octave up.
+        let slow = TrackAudio(left: Probe.sine(300, seconds: 2, rate: Probe.rate / 2), sampleRate: Probe.rate / 2)
+        sampler.load(SampleClip(audio: slow), on: 1)
+        sampler.trigger(1)
+        _ = try engine.render(seconds: 0.1)
+        XCTAssertEqual(Probe.frequency(of: try engine.render(seconds: 1).left[...]), 300, accuracy: 2)
+
+        // A stretch of a longer piece, as when a loop is taken from a deck: only that stretch is played.
+        var track = Probe.sine(200, seconds: 1)
+        track += Probe.sine(1000, seconds: 0.5)
+        track += Probe.sine(200, seconds: 1)
+        let taken = SampleClip(audio: TrackAudio(left: track, sampleRate: Probe.rate), from: 1, to: 1.5)
+        XCTAssertEqual(taken.duration, 0.5, accuracy: 0.0001)
+        sampler.stop()
+        sampler.load(taken, on: 4)
+        sampler.set(loops: true, on: 4)
+        sampler.trigger(4)
+        _ = try engine.render(seconds: 0.2)
+        XCTAssertEqual(Probe.frequency(of: try engine.render(seconds: 1.2).left[...]), 1000, accuracy: 4, "round and round the stretch, never outside it")
+    }
+
+    func testChangingOrClearingAPadWhileItSoundsIsSafe() throws {
+        let engine = try DeckEngine(offline: true)
+        let sampler = engine.sampler
+        sampler.load(clip(Probe.sine(440, seconds: 5)), on: 3)
+        sampler.set(loops: true, on: 3)
+        sampler.trigger(3)
+        _ = try engine.render(seconds: 0.2)
+        sampler.load(clip(Probe.sine(660, seconds: 5)), on: 3)
+        _ = try engine.render(seconds: 0.2)
+        XCTAssertEqual(level(try engine.render(seconds: 0.2).left[...]), 0, accuracy: 1e-6, "the old sound has faded and the new waits to be hit")
+        sampler.trigger(3)
+        _ = try engine.render(seconds: 0.1)
+        XCTAssertEqual(Probe.frequency(of: try engine.render(seconds: 0.5).left[...]), 660, accuracy: 3)
+        sampler.load(nil, on: 3)
+        _ = try engine.render(seconds: 0.2)
+        sampler.trigger(3)
+        XCTAssertEqual(level(try engine.render(seconds: 0.2).left[...]), 0, accuracy: 1e-6, "an empty pad plays nothing")
+        XCTAssertNil(sampler.clip(on: 3))
     }
 }

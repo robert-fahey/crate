@@ -24,10 +24,15 @@ final class DeckModel: Identifiable {
     private(set) var grid: BeatGrid?
     private(set) var detail: WaveDetail?
     private(set) var peaks: Data?
-    /// Hot cues by slot, 1...8, in seconds.
-    private(set) var cues: [Int: Double] = [:]
+    @ObservationIgnored private var isDraggingCue = false
+    /// Hot cues and saved loops by pad, 1...8.
+    private(set) var cuePoints: [Int: CuePoint] = [:]
+    /// Where each pad's cue is, in seconds.
+    var cues: [Int: Double] { cuePoints.mapValues(\.position) }
     /// Where the Cue button returns to.
     private(set) var cuePoint = 0.0
+    /// Playing only because the Cue button is being held.
+    private(set) var isCueing = false
     var problem: String?
 
     // Refreshed about twenty times a second from the engine.
@@ -174,6 +179,7 @@ final class DeckModel: Identifiable {
         isPlaying = false
         loop = nil
         cuePoint = 0
+        isCueing = false
         if echoOn { echoOn = false }
         deck.set(.dry, to: 1)
         deck.clearEcho()
@@ -198,7 +204,7 @@ final class DeckModel: Identifiable {
         grid = nil
         detail = nil
         peaks = nil
-        cues = [:]
+        cuePoints = [:]
         loop = nil
         isPlaying = false
         position = 0
@@ -223,7 +229,11 @@ final class DeckModel: Identifiable {
         }
         detail = try? store.waveDetail(id: track.id)
         peaks = try? store.waveform(id: track.id)
-        cues = (try? store.cues(id: track.id)) ?? [:]
+        // A cue being dragged in the editor is ahead of the library; it is written when it is let go.
+        if !isDraggingCue {
+            let stored = Dictionary(((try? store.cuePoints(id: track.id)) ?? []).map { ($0.slot, $0) }, uniquingKeysWith: { first, _ in first })
+            if stored != cuePoints { cuePoints = stored }
+        }
         mixer?.sync.setGrid(grid, for: id)
         if let updated = try? store.track(id: track.id) { self.track = updated }
     }
@@ -293,6 +303,11 @@ final class DeckModel: Identifiable {
             return
         }
         guard track != nil else { return }
+        // Play pressed while Cue is held: the deck carries on when Cue is let go.
+        if isCueing {
+            isCueing = false
+            return
+        }
         if deck.state().isPlaying { pause() } else { play() }
     }
 
@@ -311,12 +326,25 @@ final class DeckModel: Identifiable {
 
     func pause() {
         startsOnArrival = false
+        isCueing = false
         deck.pause()
         isPlaying = false
     }
 
-    /// The Cue button, as on a CDJ: while playing it goes back to the cue point and
-    /// stops; while stopped it moves the cue point to where the deck is.
+    /// The Cue button going down, as on a CDJ. While playing it goes back to the cue
+    /// point and stops. While stopped it moves the cue point to where the deck is, if
+    /// it is not there already, and plays from it for as long as the button is held.
+    func cueDown() {
+        guard track != nil, arriving == nil, !isCueing else { return }
+        let wasPlaying = deck.state().isPlaying
+        cue()
+        guard !wasPlaying else { return }
+        play()
+        isCueing = isPlaying
+    }
+
+    /// Cue without the hold, which is what the agent asks for: back to the cue point and
+    /// stopped if playing, otherwise the cue point moves to where the deck is.
     func cue() {
         guard track != nil else { return }
         let state = deck.state()
@@ -327,6 +355,14 @@ final class DeckModel: Identifiable {
             cuePoint = snapped(state.position)
             deck.seek(to: cuePoint)
         }
+    }
+
+    /// The Cue button let go: back to the cue point and stopped, unless Play was
+    /// pressed meanwhile, in which case the deck carries on.
+    func cueUp() {
+        guard isCueing else { return }
+        pause()
+        deck.seek(to: cuePoint)
     }
 
     /// The nearest beat, when Snap is on and the track has a grid.
@@ -425,22 +461,53 @@ final class DeckModel: Identifiable {
 
     // MARK: Hot cues
 
-    /// Jumps to a hot cue, or sets it here if the slot is empty.
+    /// Jumps to a hot cue, or sets it here if the pad is empty. A saved loop goes there and goes round.
     func hotCue(_ slot: Int) {
-        guard let track else { return }
-        if let position = cues[slot] {
-            jump(to: position)
+        guard track != nil else { return }
+        if let cue = cuePoints[slot] {
+            jump(to: cue.position)
+            if let end = cue.loopEnd { setLoop(from: cue.position, to: end) }
         } else {
-            let position = snapped(deck.state().position)
-            cues[slot] = position
-            try? store.setCue(id: track.id, slot: slot, position: position)
+            setCuePoint(CuePoint(slot: slot, position: snapped(deck.state().position)))
         }
     }
 
     func clearHotCue(_ slot: Int) {
         guard let track else { return }
-        cues[slot] = nil
+        cuePoints[slot] = nil
         try? store.setCue(id: track.id, slot: slot, position: nil)
+    }
+
+    /// Sets or changes one cue, name and loop included.
+    func setCuePoint(_ cue: CuePoint) {
+        guard let track, CuePoint.slots.contains(cue.slot) else { return }
+        cuePoints[cue.slot] = cue
+        try? store.setCuePoint(id: track.id, cue)
+    }
+
+    /// Moves a cue on screen only, while it is being dragged. `endCueDrag` writes where it ends up.
+    func dragCuePoint(_ cue: CuePoint) {
+        isDraggingCue = true
+        cuePoints[cue.slot] = cue
+    }
+
+    func endCueDrag() {
+        guard isDraggingCue, let track else { return }
+        isDraggingCue = false
+        try? store.setCuePoints(id: track.id, Array(cuePoints.values))
+    }
+
+    /// Replaces every cue at once, as the cue editor's undo and its suggestions do.
+    func setCuePoints(_ cues: [CuePoint]) {
+        guard let track else { return }
+        cuePoints = Dictionary(cues.filter { CuePoint.slots.contains($0.slot) }.map { ($0.slot, $0) }, uniquingKeysWith: { first, _ in first })
+        try? store.setCuePoints(id: track.id, Array(cuePoints.values))
+    }
+
+    /// The cues and loops Crate would pick from the track's shape; empty until the track is analysed.
+    func suggestedCues() -> [CuePoint] {
+        guard let track, let found = try? CueTools.suggestions(for: track, store: store) else { return [] }
+        return found.cues
     }
 
     // MARK: Beat grid edits
@@ -656,6 +723,8 @@ final class DJMixer {
             chooseOutput()
         }
     }
+    /// The eight sample pads.
+    @ObservationIgnored private(set) var sampler: SamplerModel!
     /// Cues, loops and jumps land on beats.
     var snap = true
     private(set) var masterDeck: DeckID?
@@ -695,12 +764,26 @@ final class DJMixer {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+        sampler = SamplerModel(sampler: engine.sampler, store: store, mixer: self)
     }
 
     func deck(_ id: DeckID) -> DeckModel { decks[id.rawValue] }
 
+    /// Starts the audio engine if nothing has yet: the sampler can be the first thing to make a sound.
+    func startEngine() {
+        do {
+            try engine.start()
+        } catch {
+            problem = "The audio output could not be started: \(error.localizedDescription)"
+        }
+    }
+
     func applyMixer() {
         var settings = engine.settings
+        if let sampler {
+            settings.sampler = sampler.level
+            settings.samplerCue = sampler.cue
+        }
         settings.crossfader = crossfader
         settings.master = masterVolume
         settings.fader = decks.map(\.fader)
@@ -788,6 +871,7 @@ final class DJMixer {
 
     func poll() {
         for deck in decks { deck.poll() }
+        sampler.poll()
         let cross = engine.settings.crossfader
         if abs(crossfader - cross) > 0.002 {
             pulling = true

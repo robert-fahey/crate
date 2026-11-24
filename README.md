@@ -2,7 +2,7 @@
 
 A Mac DJ app: a crate browser, two decks you can beat match and mix on, and a built-in agent on the Cursor SDK that can dig through the library and mix for you.
 
-![The library with two decks playing in sync](docs/screenshots/library-and-decks.png)
+![A crate with two decks playing in sync, and the agent bar offering what to ask about the selected track](docs/screenshots/library-and-decks.png)
 
 - **Library**: local folders (FLAC, WAV, AIFF, MP3, M4A), with files under a minute skipped as samples. Tracks on external drives stay in the library, dimmed, while the drive is unplugged. The list sorts by two columns at once: the header clicked last leads, and the one clicked before it orders the ties. Click Key and then BPM for tempo order with the keys in Camelot order at each tempo (to the whole BPM); click BPM and then Key for the reverse.
 - **DJ data**: BPM and key from tags where present, otherwise estimated by Crate (shown with `~`). Keys are in Camelot notation. Every local track also gets a beat grid and a colour waveform.
@@ -18,7 +18,7 @@ Needs Xcode (Swift 5.9+) and [Bun](https://bun.sh).
 
 ```sh
 ./build.sh run        # builds build/Crate.app and launches it
-swift test            # 144 tests; the agent bridge tests need ./build.sh to have run once
+swift test            # 168 tests; the agent bridge tests need ./build.sh to have run once
 cd agent && npm run build && npm test   # sidecar protocol tests (Node 22.13+)
 ```
 
@@ -39,7 +39,7 @@ The app is signed ad hoc. macOS ties privacy permissions and keychain access to 
 - **Loading**: nothing about loading touches the disk on the main thread, so a slow or sleeping drive never freezes the window: the deck says "Loading…" until the track lands, and Play pressed meanwhile starts it the moment it does. Drag a track onto a deck, right-click > Load on Deck A/B, or ⌘← / ⌘→ for the selected track. Double-click plays a track if nothing is playing; if a deck is already playing it only loads the other deck, so a slip never cuts a live mix.
 - **Sync**: press SYNC on the deck you are bringing in. It takes the other deck's tempo, and pressing play starts it on the beat. Pressed on a deck that is already playing, it jumps onto the beat at once, by less than half a beat. Sync matches beats, not bars: start it on a bar line (the stronger lines) yourself. The master is the deck being followed: the one that was playing first. When it stops, or its track runs out, the deck still playing becomes the master and keeps the job. MASTER picks one by hand. A track whose tempo was read at half or double (67 for 134) still syncs at its own speed.
 - **The waveform**: drag to scratch. Two-finger scroll nudges a playing deck ahead or back and scrubs a stopped one. Click a stopped deck to jump there. Pinch or ⌘-scroll zooms both decks.
-- **Cue**: as on a CDJ. While playing it returns to the cue point and stops; while stopped it sets the cue point. With SNAP on, cues, loops and jumps land on beats.
+- **Cue**: as on a CDJ. Hold it on a stopped deck and the track plays from the cue point for as long as it is held; let go and the deck is back on the cue point, stopped. Press Play while holding it and the deck carries on. While playing, Cue returns to the cue point and stops. On a deck stopped somewhere else, it moves the cue point there first. The on-screen button, the Q and I keys and the controller's CUE buttons all work this way. With SNAP on, cues, loops and jumps land on beats.
 - **If the beat lines are off**: the usual case is a grid sitting on the off-beat, with the lines halfway between the kicks. GRID > Move Grid Half a Beat fixes that in one go. The GRID menu also has finer nudges: move the whole grid a few milliseconds, set where the bar starts, halve or double the tempo. GRID > Edit Grid… (or right-click a track > Edit Beat Grid…) opens the grid editor, below.
 - **Auto DJ**: AUTO in the mixer. Tracks that are up next get mixed in rather than started cold. About 90 seconds before each mix-out point Crate asks the agent to choose the next track and schedule the mix; if nothing is scheduled 25 seconds out, Crate mixes in the next track itself with a 32-beat bass swap. The ✕ next to the mix status cancels a mix so you can take over.
 - **Large decks**: the arrows button beside the mixer's volume knob (or ⇧⌘L) switches to taller waveforms and bigger controls. It grows up to half as big again, as far as the window allows.
@@ -53,6 +53,58 @@ The app is signed ad hoc. macOS ties privacy permissions and keychain access to 
 
   Space plays or pauses.
 
+## A crate as a mix
+
+![The mix editor](docs/screenshots/mix-editor.png)
+
+A crate can carry a mix: for each track going into the next, a saved transition. Open the mix editor with the Mix button in the toolbar while a crate is on screen, or "Edit Mix…" on a crate.
+
+- **The crate, top to bottom** is on the left, with how each track goes into the next: the style, the length, and who set it (You, the Agent, or Crate). A pair with nothing saved shows what Crate would do.
+- **One transition** is laid out on the right as two waveforms in step: the track being left above, the one coming in below, and the stretch where both play shaded. The white line is each track's fader through the mix and the dashed blue line its bass. Drag the upper waveform to move where the first track is left, the lower to move where the next comes in; they move a bar at a time. The arrows beside "Leave" and "Come in on" do the same by a bar or eight.
+- **Styles**: blend, bass swap, filter, echo out, cut, tape stop. **Length**: 8, 16, 32 or 64 beats for the styles that overlap. Anything changed is saved with the crate at once; Undo steps back.
+- **Preview** plays the first track from two bars before the mix and then the mix itself, on the two decks, so it needs both decks free.
+- **Suggest the Rest** saves Crate's own transition for every pair without one: out where the first track thins, in where the next begins, a 32-beat bass swap when the tempos are close and an echo out when they are not.
+- **Ask the Agent to Plan It**, or "plan a mix of this crate" in the agent bar: the agent orders the crate, looks at each track's structure and saves a transition for every pair, with a note on each saying why. It keeps the ones you set. Its tools are `mix_plan`, `mix_plan_set` and `mix_plan_clear`.
+- **Play Mix** (in the editor, or on a crate's menu) plays the crate from the top, each track going into the next as saved. Nothing is asked of the agent while it plays, so it costs nothing and goes the same way every time. Where a pair has nothing saved, Crate mixes its own way.
+- A saved transition is also followed whenever those two tracks follow each other with AUTO on.
+- The mix is kept on this Mac; it is not yet shared with your other Macs. Reordering the crate keeps the transitions of pairs that are still neighbours.
+
+## Cue points and saved loops
+
+![The cue editor](docs/screenshots/cue-editor.png)
+
+Each track has eight pads. A pad holds a hot cue (a place to jump to) or a saved loop (a place that goes round when its pad is hit). Hitting an empty pad sets a cue where the deck is.
+
+- **The cue editor** opens from EDIT at the end of a deck's pads, or "Edit Cue Points…" on a track. The pads are flags along the waveform: drag one to move it, drag a loop's far edge to change its length, double-click the wave to put a cue there, double-click a flag to go to it. Everything lands on the beat while SNAP is on; hold Shift to place one freely. The rows underneath name each pad, turn it into a loop of 1 to 32 beats, move it to the playhead or clear it. Undo and Redo cover every change.
+- **Suggest** fills the empty pads from the track's shape: where it starts, where the bass comes in, each breakdown and the drop after it, where the outro begins, and four-bar loops at each end for mixing in and out. It is instant and costs nothing, and it is only as right as the beat grid, so check it by ear.
+- **Ask the Agent** has the agent do the same with more thought. It can read a track's structure and its cues and set or clear them (`cue_points`, `cue_set`, `cue_clear`), so "set cues for everything in this crate" or "put a loop on the last four bars of the intro" work from the agent bar too. It cannot hear the music; it works from Crate's analysis.
+- Cue names and saved loops are shared between your Macs with the rest of a track's cues.
+
+## Sampler
+
+![The sampler under the decks](docs/screenshots/sampler.png)
+
+Eight pads for one-shot sounds and loops, in a row under the decks. Show it with the grid button beside the mixer's volume knob, or ⇧⌘S.
+
+- **Loading a pad**: drag an audio file from the Finder or a track from the list onto it, click an empty pad to choose a file, or right-click a track and "Send to Sampler". A pad takes at most the first two minutes of a file, and any audio file will do, including the short ones the library leaves out.
+- **Taking a loop from a deck**: right-click a pad and "Take the Loop from Deck A". It takes what the deck is looping, or four beats from where it is, and plays it as a loop.
+- **Playing**: a pad sounds as the mouse goes down. A one-shot starts from the top every time it is hit; a loop goes round until it is hit again. The square button stops everything. Right-click a pad for Loop, its level, and Clear.
+- **In the mix**: the sampler has its own level knob and goes straight to the master, past the crossfader. With a four-output sound card the headphone button sends it to the headphones whatever its level.
+- **On the DDJ-FLX4**: SAMPLER pad mode plays the eight pads from either side; SHIFT + pad stops one.
+- The pads are remembered on this Mac. Samples are not kept in time with the decks.
+
+## Talking to the agent
+
+The agent bar is at the bottom of the window. ⌘K puts the cursor in it.
+
+- **A crate has its own conversation.** Select a crate and the bar is that crate's conversation: its name is on the bar, its history is its own, and the agent takes "add some more" or "tidy the order" to mean that crate. What was said about a crate is still there next time, on this Mac. Everywhere else (All Tracks, To Tag, a source) is the library's conversation. Deleting a crate deletes its conversation.
+- **It knows what you are looking at.** Every request carries the crate or list on screen, the tracks selected in the list and what is on each deck, so "this", "these" and "what's playing" mean what you would expect.
+- **It offers things to ask.** The line above the text field changes with what is on screen: "What mixes with this?" with a track selected, "What should I play next?" while a deck plays, "Fill this crate…" in an empty crate. A question is asked the moment it is clicked. Anything that would change a crate or touch the decks is put in the text field instead, to finish or send with Return, so one click never starts a mix. Right-click a track for the same offers under "Ask the Agent".
+- **A new crate can be described.** Make a crate, say what it is for ("warm-up disco around 115"), and the agent fills it from the library and gives it a name.
+- **Track names in replies are links.** Click one for buttons to load it on deck A or B, add it to the crate on screen, or show it in the list.
+- **While it works** the line above the field says what it is doing. The agent takes one request at a time; start one in a crate and move elsewhere and the bar says where it is busy.
+- The "…" menu on an open conversation has **Start Over** (the agent forgets that conversation; the others are untouched) and **Clear History**.
+
 ## DJ controller and headphones
 
 <img src="docs/screenshots/audio-settings.png" width="580" alt="Settings > Audio">
@@ -62,14 +114,14 @@ Crate works with the **Pioneer DJ DDJ-FLX4**: as its sound card, with headphone 
 - **Sound**: the master mix goes to the controller's master output, the headphones to its headphone socket. Settings > Audio chooses the output; Automatic uses the controller when it is plugged in and the Mac's own output when it is not. The controller's MASTER LEVEL and HEADPHONES LEVEL knobs work on the controller itself.
 - **Headphone cue**: the CUE button over each channel fader (or the headphone buttons in Crate's mixer) puts that deck in the headphones before its fader is up. HEADPHONES MIXING (CUE·MIX on screen) blends from the cued decks to the master mix. Cue and master reach the headphones in step, so beats can be matched by ear.
 - **Decks**: play, cue, beat sync (hold it to make the deck the tempo master), tempo sliders, jog wheels (hand on top to scratch, the edge to nudge, with SHIFT to search), loop IN and OUT (hold IN for a four-beat loop), RELOOP/EXIT, and ½X / 2X.
-- **Pads**: HOT CUE (SHIFT + pad clears one), BEAT LOOP (¼ to 32 beats) and BEAT JUMP (1 to 8 beats either way).
+- **Pads**: HOT CUE (SHIFT + pad clears one; a pad holding a saved loop starts it), BEAT LOOP (¼ to 32 beats), BEAT JUMP (1 to 8 beats either way) and SAMPLER.
 - **Mixer**: trim, three-band EQ, CFX as the filter, channel faders, crossfader.
 - **Browse**: the knob moves through the track list, LOAD puts the selected track on a deck, pressing the knob loads it on the free deck, and SHIFT + the knob zooms the waveforms.
 - **Beat FX**: ON/OFF is the echo for the chosen channel; BEAT ◀ ▶ halve and double its time.
 - **Lights** follow the decks: play, cue, sync, headphone cue, loops, hot cues, and the channel level meters.
 - A tempo slider only takes hold of a deck's tempo once it has been moved to where the tempo already is, so a slider left elsewhere cannot make the tempo jump. A synced deck ignores its slider.
 
-Not mapped: SMART CFX, SMART FADER, the sampler, keyboard and pad FX modes, and the Beat FX level knob.
+Not mapped: SMART CFX, SMART FADER, the keyboard and pad FX modes, and the Beat FX level knob.
 
 Any sound card with four outputs gets the same headphone monitoring (master on outputs 1-2, headphones on 3-4), with the cue buttons in Crate's mixer.
 
@@ -144,7 +196,7 @@ The Cursor SDK's built-in shell, edit, write and delete tools are switched off; 
 
 - `CRATE_FAKE_SDK=1` swaps the Cursor SDK for an offline stand-in (no network, no cost). It is not an AI: plain text runs a library search, and `/tool <name> <json>` calls one tool.
 - `CRATE_DB=<path>` uses a different library file and keeps credentials in memory instead of the keychain.
-- `CRATE_DEBUG='volume:0.05;load:A:3;deck:A:play;wait:5;decks;snapshot:/tmp/crate.png;quit'` scripts the running app; see `Sources/Crate/DebugDriver.swift`. The `stall` step prints the longest the main thread has stood still since it was last asked: the check that nothing (loading a track above all) holds up the interface. The `snapshot` step photographs Crate's own window, which needs no screen-recording permission; `settings:audio` opens Settings on a tab and `snapshot:<path>:settings` photographs that window. The pictures in `docs/screenshots` were made this way.
+- `CRATE_DEBUG='volume:0.05;load:A:3;deck:A:play;wait:5;decks;snapshot:/tmp/crate.png;quit'` scripts the running app; see `Sources/Crate/DebugDriver.swift`. `mouse:266,376:down` and `mouse:266,376:up` press and release the mouse at a point in the window, for buttons that act while held. `offers` prints which conversation is on screen and what the agent bar is offering (`offers:1` clicks the second offer), and `select:0,3` selects rows. The offline agent answers `/context` with what the app told it is on screen and `/say <text>` with that text, which is how a track link is tried. `cues:A` opens the cue editor on deck A, `cues:A:suggest` fills its empty pads and `cues:A:list` prints them; `sampler:show`, `sampler:load:<pad>:<row>`, `sampler:take:<pad>:A`, `sampler:hit:<pad>` and `sampler:stop` work the sampler. `mouse:x,y:move` and `mouse:x,y:double` complete a drag and make a double-click. `mixplan:<crate>` opens the mix editor; `mixplan:<crate>:suggest`, `:list`, `:play`, `:nearout` (winds the playing deck on to just before its saved transition) and `:preview:0` work a crate's mix. The `stall` step prints the longest the main thread has stood still since it was last asked: the check that nothing (loading a track above all) holds up the interface. The `snapshot` step photographs Crate's own window, which needs no screen-recording permission; `settings:audio` opens Settings on a tab and `snapshot:<path>:settings` photographs that window. The pictures in `docs/screenshots` were made this way.
 - `CRATE_FAKE_CONTROLLER=1` adds a pretend DDJ-FLX4 as a MIDI device, so the controller link can be tried without one: in a `CRATE_DEBUG` script, `midi:90 0B 7F` presses deck 1's play button and `controller` prints what Crate did and which lights it lit.
 - `CRATE_EVAL_DB=<library> swift test --filter RealTrackEvaluation` measures the beat tracker on a real library. Adding `CRATE_EVAL_MIX=<out.wav>` with `--filter RealMixEvaluation` renders a synced blend of two tracks and measures how well their drums line up. With `CRATE_EVAL_CACHE=<folder>` (decoded audio is kept there between runs) and `-c release`: `--filter KickMapEvaluation` prints, along each track, whether the kicks fall on the grid's beats or between them; `--filter SteadyTempoEvaluation` prints the fixed-tempo fits; `CRATE_EVAL_PAIRS=12:7,… --filter RealPairEvaluation` compares old and new grids on synced pairs of tracks, kick against kick.
 

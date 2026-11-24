@@ -138,6 +138,8 @@ struct TransportButtonStyle: ButtonStyle {
     var isOn = false
     var colors: [Color] = [.white, .white]
     var size: CGFloat = 40
+    /// For a button that acts while held: called with true as it goes down and false as it comes up.
+    var onPress: ((Bool) -> Void)?
 
     func makeBody(configuration: Configuration) -> some View { Face(style: self, configuration: configuration) }
 
@@ -167,6 +169,7 @@ struct TransportButtonStyle: ButtonStyle {
                 .scaleEffect(configuration.isPressed ? 0.93 : 1)
                 .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
                 .animation(.easeOut(duration: 0.18), value: isOn)
+                .onChange(of: configuration.isPressed) { _, pressed in style.onPress?(pressed) }
         }
     }
 }

@@ -4,8 +4,8 @@ import CrateCore
 /// Keys for working the decks without the mouse. They are ignored while a text
 /// field is being typed in, so searching and talking to the agent are unaffected.
 ///
-///     Deck A   Q cue · W play · E sync · A/S nudge back/ahead · Z loop · X/C loop half/double · 1–4 hot cues
-///     Deck B   I cue · O play · P sync · K/L nudge back/ahead · , loop · . and / loop half/double · 7–0 hot cues
+///     Deck A   Q cue (hold) · W play · E sync · A/S nudge back/ahead · Z loop · X/C loop half/double · 1–4 hot cues
+///     Deck B   I cue (hold) · O play · P sync · K/L nudge back/ahead · , loop · . and / loop half/double · 7–0 hot cues
 ///     Space    play or pause what is playing
 @MainActor
 final class DeckShortcuts {
@@ -13,8 +13,8 @@ final class DeckShortcuts {
     private weak var model: AppModel?
 
     static let help = """
-        Deck A:  Q cue,  W play/pause,  E sync,  A and S nudge back/ahead (hold),  Z loop,  X and C halve/double the loop,  1–4 hot cues
-        Deck B:  I cue,  O play/pause,  P sync,  K and L nudge back/ahead (hold),  comma loop,  full stop and slash halve/double the loop,  7–0 hot cues
+        Deck A:  Q cue (hold to play),  W play/pause,  E sync,  A and S nudge back/ahead (hold),  Z loop,  X and C halve/double the loop,  1–4 hot cues
+        Deck B:  I cue (hold to play),  O play/pause,  P sync,  K and L nudge back/ahead (hold),  comma loop,  full stop and slash halve/double the loop,  7–0 hot cues
         Space:  play or pause.   ⌘← and ⌘→ load the selected track on deck A or B.
         """
 
@@ -43,18 +43,22 @@ final class DeckShortcuts {
             if !event.isARepeat { deck.bend(down ? amount : 0) }
             return true
         }
-        guard down, !event.isARepeat else { return ["q", "w", "e", "z", "x", "c", "i", "o", "p", ",", ".", "/", " "].contains(key) }
+        // Cue plays while held.
+        if key == "q" || key == "i" {
+            let deck = key == "q" ? a : b
+            if !event.isARepeat { if down { deck.cueDown() } else { deck.cueUp() } }
+            return true
+        }
+        guard down, !event.isARepeat else { return ["w", "e", "z", "x", "c", "o", "p", ",", ".", "/", " "].contains(key) }
 
         switch key {
         case " ": model.player.togglePlayPause()
-        case "q": a.cue()
         case "w": a.togglePlay()
         case "e": a.isSynced.toggle()
         case "z": a.toggleLoop()
         case "x": a.scaleLoop(by: 0.5)
         case "c": a.scaleLoop(by: 2)
         case "1", "2", "3", "4": a.hotCue(Int(key) ?? 1)
-        case "i": b.cue()
         case "o": b.togglePlay()
         case "p": b.isSynced.toggle()
         case ",": b.toggleLoop()

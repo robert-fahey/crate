@@ -50,7 +50,7 @@ final class AgentToolTests: XCTestCase {
             }
         }
         // The instructions must not promise tools that do not exist.
-        for name in ["library_search", "crate_reorder", "player_queue_add", "find_audio_files", "analyze_tracks"] {
+        for name in ["library_search", "crate_reorder", "crate_rename", "player_queue_add", "find_audio_files", "analyze_tracks"] {
             XCTAssertTrue(names.contains(name), name)
         }
     }
@@ -105,6 +105,19 @@ final class AgentToolTests: XCTestCase {
         result = await call("crate_remove_tracks", ["crate": "Boogie", "tracks": [.number(Double(local))]])
         XCTAssertEqual(result.content["removed"], 1)
         XCTAssertEqual(try store.stats().tracks, 2, "removing from a crate leaves the track in the library")
+    }
+
+    func testACrateCanBeRenamedButNotOntoAnother() async throws {
+        _ = await call("crate_create", ["name": "New Crate"])
+        _ = await call("crate_create", ["name": "Boogie"])
+        var result = await call("crate_rename", ["crate": "new crate", "name": "Warm-up Disco"])
+        XCTAssertTrue(result.ok, "\(result.content)")
+        XCTAssertEqual(result.content["crate"], "Warm-up Disco")
+        XCTAssertEqual(try store.crates().map(\.name).sorted(), ["Boogie", "Warm-up Disco"])
+
+        result = await call("crate_rename", ["crate": "Warm-up Disco", "name": "Boogie"])
+        XCTAssertFalse(result.ok, "the name is taken")
+        XCTAssertNotNil(try store.crate(named: "Warm-up Disco"))
     }
 
     func testBadReferencesAreExplainedAndLeaveNothingHalfDone() async throws {
@@ -293,6 +306,37 @@ final class AgentBridgeTests: XCTestCase {
         XCTAssertTrue(text.contains("Paradise") && text.contains("Change"), text)
     }
 
+    /// Changing crate changes conversation. The request is sent straight behind the change, without waiting for
+    /// the agent to say the conversation is ready, and must be answered in the new one.
+    func testARequestSentStraightAfterChangingConversationIsAnsweredInTheNewOne() async throws {
+        let bridge = AgentBridge(launch: try sidecar(), registry: ToolRegistry())
+        let recorder = Recorder()
+        bridge.onEvent = { recorder.add($0) }
+        try bridge.start()
+        defer { bridge.stop() }
+        func turns() -> Int { recorder.all.filter { if case .turnEnded = $0 { return true } else { return false } }.count }
+
+        bridge.startSession(AgentSessionConfig(model: "offline", workingDirectory: NSTemporaryDirectory(), libraryFolders: []))
+        bridge.chat("/say in the library")
+        let first = await recorder.wait { _ in turns() == 1 }
+        XCTAssertTrue(first, "\(recorder.all)")
+
+        bridge.startSession(AgentSessionConfig(
+            model: "offline", workingDirectory: NSTemporaryDirectory(), libraryFolders: [], resumeID: "agent-of-a-crate"))
+        let context = AgentContext(view: "Disco Mix", crate: Crate(id: 1, name: "Disco Mix", trackCount: 11, uid: "u1"))
+        bridge.chat(context.preamble() + "/context")
+        let second = await recorder.wait { _ in turns() == 2 }
+        XCTAssertTrue(second, "\(recorder.all)")
+
+        let events = recorder.all
+        XCTAssertTrue(events.contains(.sessionStarted(agentID: "agent-of-a-crate", resumed: true)), "\(events)")
+        XCTAssertFalse(events.contains { if case .error = $0 { return true } else { return false } }, "\(events)")
+        let text = events.compactMap { if case .textDelta(let text) = $0 { return text } else { return nil } }.joined()
+        XCTAssertTrue(text.contains("in the library"))
+        XCTAssertTrue(text.contains("looking at the crate \"Disco Mix\" (11 tracks)"), "the agent is told what is on screen: \(text)")
+        XCTAssertFalse(text.contains("/context"), "and what the DJ typed is kept apart from it")
+    }
+
     func testCancelEndsATurnAndStopReportsAnExpectedExit() async throws {
         let bridge = AgentBridge(launch: try sidecar(), registry: ToolRegistry())
         let recorder = Recorder()
@@ -310,5 +354,131 @@ final class AgentBridgeTests: XCTestCase {
         let exited = await recorder.wait { $0.contains(.exited(expected: true)) }
         XCTAssertTrue(exited)
         XCTAssertFalse(bridge.isRunning)
+    }
+}
+
+
+final class AgentContextTests: XCTestCase {
+    private func track(_ id: Int64, _ artist: String, _ title: String, bpm: Double? = nil, key: String? = nil) -> Track {
+        Track(
+            id: id, source: .local, uri: "file:-:/\(title)", title: title, artist: artist, album: "", duration: 300, bpm: bpm, key: key,
+            format: "flac", addedAt: Date(timeIntervalSince1970: 0), notes: "", analyzed: true)
+    }
+
+    private let disco = Crate(id: 3, name: "Disco Mix", trackCount: 11, uid: "abc-123")
+
+    func testACrateKeepsItsConversationThroughARenameAndTheLibraryKeepsTheOneItHad() {
+        var renamed = disco
+        renamed.name = "Disco, Sunday"
+        XCTAssertEqual(ConversationID.crate(disco), ConversationID.crate(renamed))
+        XCTAssertNotEqual(ConversationID.crate(disco), ConversationID.crate(Crate(id: 4, name: "Disco Mix", trackCount: 0, uid: "other")))
+        XCTAssertEqual(ConversationID.crate(disco).historySetting, "agent.history.crate.abc-123")
+        XCTAssertEqual(ConversationID.crate(disco).agentSetting, "agent.id.crate.abc-123")
+        // A crate from before crates had an identity of their own still gets a conversation.
+        XCTAssertEqual(ConversationID.crate(Crate(id: 9, name: "Old", trackCount: 0)).key, "crate.#9")
+        // The one conversation there used to be is the library's.
+        XCTAssertEqual(ConversationID.library.historySetting, "agent.history")
+        XCTAssertEqual(ConversationID.library.agentSetting, "agent.id")
+    }
+
+    func testStartingEveryConversationAfreshLeavesOtherSettingsAlone() throws {
+        let store = try LibraryStore(path: ":memory:")
+        store.setSetting("agent.id", "a")
+        store.setSetting("agent.id.crate.abc", "b")
+        store.setSetting("agent.idle", "not an identifier")
+        store.setSetting("agent.model", "m")
+        store.setSetting("agent.history.crate.abc", "[]")
+        store.removeSettings(prefix: "agent.id.")
+        XCTAssertNil(store.setting("agent.id.crate.abc"))
+        XCTAssertEqual(store.setting("agent.id"), "a")
+        XCTAssertEqual(store.setting("agent.idle"), "not an identifier")
+        store.setSetting("agent_id", "an underscore is not a wildcard")
+        store.removeSettings(prefix: "agent.id")
+        XCTAssertNil(store.setting("agent.id"))
+        XCTAssertEqual(store.setting("agent.model"), "m")
+        XCTAssertEqual(store.setting("agent.history.crate.abc"), "[]")
+        XCTAssertEqual(store.setting("agent_id"), "an underscore is not a wildcard")
+    }
+
+    func testTheAgentIsToldWhatIsOnScreen() {
+        let dancer = track(14, "Gino Soccio", "Dancer", bpm: 122, key: "10B")
+        let harmony = track(27, "Suzi Lane", "Harmony", bpm: 122, key: "8B")
+        let context = AgentContext(
+            view: "Disco Mix", crate: disco, selection: [harmony],
+            decks: [.init(name: "A", track: dancer, bpm: 123.4, isPlaying: true), .init(name: "B", track: nil)])
+        let text = context.preamble()
+        XCTAssertTrue(text.hasPrefix("<crate-context>\n"))
+        XCTAssertTrue(text.contains("looking at the crate \"Disco Mix\" (11 tracks). This conversation belongs to that crate."))
+        XCTAssertTrue(text.contains("Selected in the list (1): id 27 Suzi Lane – Harmony (122.0 BPM, 8B)."))
+        XCTAssertTrue(text.contains("Deck A: playing id 14 Gino Soccio – Dancer (123.4 BPM, 10B)."), "the tempo as heard, not the track's own: \(text)")
+        XCTAssertTrue(text.contains("Deck B: empty."))
+        XCTAssertEqual(AgentContext.withoutPreamble(text + "add this one"), "add this one")
+        XCTAssertEqual(AgentContext.withoutPreamble("nothing in front"), "nothing in front")
+
+        let library = AgentContext(view: "All Tracks", search: "soccio").preamble()
+        XCTAssertTrue(library.contains("looking at \"All Tracks\". This is the library's conversation"))
+        XCTAssertTrue(library.contains("narrowed by the search \"soccio\""))
+        XCTAssertTrue(library.contains("Nothing is selected"))
+    }
+
+    func testALargeSelectionIsNamedInPartAndCounted() {
+        let many = (1...40).map { track(Int64($0), "Artist", "Track \($0)") }
+        let text = AgentContext(view: "All Tracks", selection: many).preamble()
+        XCTAssertTrue(text.contains("Selected in the list (40):"))
+        XCTAssertTrue(text.contains("id 12 Artist – Track 12; and 28 more."))
+        XCTAssertFalse(text.contains("Track 13"))
+    }
+
+    func testWhatIsOfferedFollowsWhatIsOnScreen() {
+        func labels(_ context: AgentContext) -> [String] { context.suggestions.map(\.label) }
+        let dancer = track(14, "Gino Soccio", "Dancer"), harmony = track(27, "Suzi Lane", "Harmony")
+        let playing = AgentContext.Deck(name: "A", track: dancer, isPlaying: true)
+
+        // An empty crate asks to be described.
+        let empty = AgentContext(view: "New Crate", crate: Crate(id: 5, name: "New Crate", trackCount: 0, uid: "n"))
+        XCTAssertEqual(labels(empty), ["Fill this crate…"])
+        XCTAssertEqual(empty.suggestions[0].request, "Fill this crate with ")
+        XCTAssertTrue(empty.placeholder.contains("Say what “New Crate” is for"))
+
+        XCTAssertEqual(labels(AgentContext(view: "Disco Mix", crate: disco)), ["Find more that fit", "Plan the mix", "Put in mixing order", "DJ this crate"])
+        XCTAssertTrue(AgentContext(view: "Disco Mix", crate: disco).placeholder.contains("“Disco Mix”"))
+
+        // One track selected while another plays: mixing into it is on offer.
+        let one = AgentContext(view: "Disco Mix", crate: disco, selection: [harmony], decks: [playing])
+        XCTAssertEqual(labels(one), ["What mixes with this?", "Mix into this", "More like this", "Plan the mix"])
+        XCTAssertEqual(one.placeholder, "Ask about “Harmony”…")
+        // Not into the track that is already playing.
+        XCTAssertFalse(labels(AgentContext(view: "All Tracks", selection: [dancer], decks: [playing])).contains("Mix into this"))
+
+        XCTAssertEqual(
+            labels(AgentContext(view: "All Tracks", selection: [dancer, harmony])), ["Order these for a set", "Make a crate from these…"])
+        XCTAssertEqual(labels(AgentContext(view: "All Tracks", decks: [playing])), ["What should I play next?", "Make a crate of…"])
+        XCTAssertEqual(labels(AgentContext(view: "All Tracks")), ["Make a crate of…", "What's in my library?"])
+        XCTAssertEqual(labels(AgentContext(view: "To Tag", needsTagging: true)), ["Tidy these up"])
+    }
+
+    func testOnlyQuestionsAreSentByOneClick() {
+        let dancer = track(14, "Gino Soccio", "Dancer"), harmony = track(27, "Suzi Lane", "Harmony")
+        let playing = AgentContext.Deck(name: "A", track: dancer, isPlaying: true)
+        let contexts = [
+            AgentContext(view: "Disco Mix", crate: disco), AgentContext(view: "Disco Mix", crate: disco, selection: [harmony], decks: [playing]),
+            AgentContext(view: "All Tracks", selection: [dancer, harmony]), AgentContext(view: "All Tracks"),
+            AgentContext(view: "To Tag", needsTagging: true), AgentContext(view: "New", crate: Crate(id: 5, name: "New", trackCount: 0)),
+        ]
+        for suggestion in contexts.flatMap(\.suggestions) {
+            // Anything that would change a crate, a track or the decks waits in the field for Return.
+            let changes = ["Mix ", "Put ", "DJ ", "Make ", "Fill ", "Fix ", "Plan "].contains { suggestion.request.hasPrefix($0) }
+            XCTAssertEqual(suggestion.sendsAtOnce, !changes, suggestion.label)
+            XCTAssertLessThanOrEqual(contexts.map(\.suggestions.count).max() ?? 0, 4)
+        }
+    }
+
+    func testATrackNamedInAReplyIsALinkToIt() {
+        XCTAssertEqual(TrackLink.url(for: 14), "crate://track/14")
+        XCTAssertEqual(TrackLink.trackID(from: URL(string: "crate://track/14")!), 14)
+        XCTAssertNil(TrackLink.trackID(from: URL(string: "https://example.com/track/14")!))
+        XCTAssertNil(TrackLink.trackID(from: URL(string: "crate://crate/14")!))
+        XCTAssertTrue(AgentInstructions.text(mixingStyle: "").contains("crate://track/ID"))
+        XCTAssertTrue(AgentInstructions.text(mixingStyle: "").contains(AgentContext.opening))
     }
 }

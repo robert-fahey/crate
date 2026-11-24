@@ -5,6 +5,7 @@ struct MainView: View {
     @Bindable var model: AppModel
     @State private var detailSize = CGSize.zero
     @State private var decksHeight: CGFloat = 430
+    @AppStorage("sampler.shown") private var showsSampler = false
 
     var body: some View {
         NavigationSplitView {
@@ -17,6 +18,14 @@ struct MainView: View {
             Button("OK") { model.alert = nil }
         } message: {
             Text(model.alert ?? "")
+        }
+        .sheet(isPresented: Binding(get: { model.mixEditing != nil }, set: { if !$0 { model.mixEditing = nil } })) {
+            if let crate = model.mixEditing {
+                MixEditor(model: model, crateID: crate) { model.mixEditing = nil }
+            }
+        }
+        .sheet(item: $model.cueEditing) { deck in
+            CueEditor(deck: model.mixer.deck(deck), model: model) { model.cueEditing = nil }
         }
         .sheet(item: $model.gridEditing) { deck in
             GridEditor(deck: model.mixer.deck(deck)) { model.gridEditing = nil }
@@ -38,13 +47,16 @@ struct MainView: View {
                 }
             }
             .frame(height: decksHeight)
+            if showsSampler {
+                SamplerStrip(model: model)
+            }
             if model.stats.tracks == 0 {
                 EmptyLibraryView(model: model)
             } else {
                 TrackTableView(model: model)
             }
             Divider()
-            AgentPanel(agent: model.agent)
+            AgentPanel(model: model, room: detailSize.height - decksHeight - (showsSampler ? SamplerStrip.height : 0))
         }
         .onGeometryChange(for: CGSize.self) { $0.size } action: { detailSize = $0 }
         // The split view asks this column how small, how big and how big ideally it could be
@@ -55,6 +67,16 @@ struct MainView: View {
         .navigationSubtitle(subtitle)
         .searchable(text: $model.searchText, placement: .toolbar, prompt: "Search title, artist, album")
         .toolbar {
+            if let crate = model.currentCrate {
+                ToolbarItem {
+                    Button {
+                        model.mixEditing = crate.id
+                    } label: {
+                        Label("Mix", systemImage: "arrow.triangle.merge")
+                    }
+                    .help("The mix editor: how each track of “\(crate.name)” goes into the next. Set it by hand, have it suggested, or ask the agent; then play the crate as a mix.")
+                }
+            }
             ToolbarItem {
                 Button {
                     model.chooseFolder()
@@ -108,6 +130,12 @@ struct SidebarView: View {
                         }
                         .contextMenu {
                             Button("Play") { play(crate) }
+                            Button("Play Mix") { Task { await model.director.playMix(crate) } }
+                            Button("Edit Mix…") { model.mixEditing = crate.id }
+                            Button("Ask the Agent About This Crate") {
+                                model.sidebar = .crate(crate.id)
+                                model.draft.focus()
+                            }
                             Button("Rename…") {
                                 newName = crate.name
                                 renaming = crate
@@ -320,6 +348,30 @@ struct TrackTableView: View {
                 Button("Copy to This Mac") { model.copyToThisMac(tracks) }
             }
             Divider()
+            Menu("Ask the Agent") {
+                // The same offers the agent bar makes for a selection. The tracks are selected first, since
+                // "the selected track" is how the request names them.
+                ForEach(model.suggestions(for: tracks)) { suggestion in
+                    Button(suggestion.label) {
+                        model.selection = Set(tracks.map(\.id))
+                        model.use(suggestion)
+                    }
+                }
+                Divider()
+                Button("Something Else…") {
+                    model.selection = Set(tracks.map(\.id))
+                    model.draft.focus()
+                }
+            }
+            if tracks.count == 1, first.source == .local {
+                Menu("Send to Sampler") {
+                    ForEach(model.mixer.sampler.pads) { pad in
+                        Button(pad.isLoaded ? "Pad \(pad.id + 1) (replaces “\(pad.name)”)" : "Pad \(pad.id + 1)") {
+                            model.sendToSampler(trackID: first.id, pad: pad.id)
+                        }
+                    }
+                }
+            }
             Menu("Add to Crate") {
                 ForEach(model.crates) { crate in
                     Button(crate.name) { model.add(tracks.map(\.id), to: crate) }
@@ -341,6 +393,7 @@ struct TrackTableView: View {
             .disabled(tracks.allSatisfy { $0.bpm == nil })
             if tracks.contains(where: { $0.source == .local }) {
                 if tracks.count == 1 {
+                    Button("Edit Cue Points…") { model.editCues(for: first) }
                     Button("Edit Beat Grid…") { model.editGrid(for: first) }
                 }
                 Button("Analyse BPM and Key Again") { model.reanalyze(tracks) }

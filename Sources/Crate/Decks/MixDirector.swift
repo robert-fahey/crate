@@ -22,9 +22,13 @@ final class MixDirector {
     var isAuto = false {
         didSet {
             asked = []
-            if isAuto { activity = "Auto DJ on" }
+            if isAuto { activity = "Auto DJ on" } else { mixCrate = nil }
         }
     }
+    /// The crate being played as a mix: its saved transitions are followed, and the agent is not asked.
+    private(set) var mixCrate: Crate?
+    /// A transition is being tried out from the mix editor.
+    private(set) var isPreviewing = false
     /// What the auto DJ last did, shown under the mixer.
     private(set) var activity: String?
 
@@ -76,6 +80,63 @@ final class MixDirector {
     func cancel() {
         runner.cancel()
         status = runner.status
+    }
+
+    // MARK: A crate's mix
+
+    /// The transition saved for one track going into another: in the crate being played as a mix, or failing
+    /// that in any crate where the two are joined.
+    private func savedStep(from: Int64, to: Int64) -> MixStep? {
+        if let mixCrate, let step = try? store.mixStep(crate: mixCrate.id, from: from, to: to) { return step }
+        for crate in (try? store.crates()) ?? [] where crate.id != mixCrate?.id {
+            if let step = try? store.mixStep(crate: crate.id, from: from, to: to) { return step }
+        }
+        return nil
+    }
+
+    /// Plays a crate as a mix from one of its tracks: each transition as saved, and Crate's own where none is.
+    func playMix(_ crate: Crate, from start: Int = 0) async {
+        guard let tracks = try? store.tracks(inCrate: crate.id).filter({ $0.source == .local }), !tracks.isEmpty else { return }
+        stopPreview()
+        await player.playAndWait(tracks, startingAt: start)
+        isAuto = true
+        mixCrate = crate
+        activity = "Playing the mix of “\(crate.name)”"
+    }
+
+    /// Tries a transition out: the outgoing track from two bars before the mix, then the mix itself.
+    /// It uses both decks, so it refuses while one of them is playing something else.
+    func preview(_ step: MixStep) async throws {
+        guard let from = try store.track(id: step.from), let to = try store.track(id: step.to) else { throw ToolError("One of the tracks has gone from the library.") }
+        let busy = mixer.decks.filter { $0.isPlaying && $0.track?.id != step.from && $0.track?.id != step.to }
+        guard busy.isEmpty || isPreviewing else { throw ToolError("A preview uses both decks. Stop deck \(busy[0].id.name) first.") }
+        stopPreview()
+        isAuto = false
+        do {
+            if mixer.deck(.a).track?.id != from.id { try await mixer.load(from, on: .a) }
+            if mixer.deck(.b).track?.id != to.id { try await mixer.load(to, on: .b) }
+        } catch {
+            throw ToolError(Self.reason(error))
+        }
+        let out = mixer.deck(.a)
+        await ensureAnalysed(out)
+        await ensureAnalysed(mixer.deck(.b))
+        let lead = out.grid.map { 8 * 60 / max(60, $0.bpm) } ?? 4
+        out.setTempoOffset(0)
+        out.seek(to: max(0, step.outAt - lead))
+        mixer.crossfader = 0
+        out.play()
+        isPreviewing = true
+        // The deck has to be seen playing before a mix out of it can be scheduled.
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        _ = try await schedule(step.request)
+    }
+
+    func stopPreview() {
+        guard isPreviewing else { return }
+        isPreviewing = false
+        cancel()
+        for deck in mixer.decks where deck.isPlaying { deck.pause() }
     }
 
     // MARK: Scheduling a mix
@@ -217,6 +278,24 @@ final class MixDirector {
         guard !candidates.isEmpty else { return }
 
         let state = out.deck.state()
+
+        // A transition saved for these two is followed as it stands; nobody needs asking.
+        // (If it cannot be done, the track is marked as dealt with and Crate mixes out of it its own way below.)
+        if !asked.contains(track.id), let step = savedStep(from: track.id, to: candidates[0].id) {
+            let seconds = (step.outAt - state.position) / max(0.25, state.speed)
+            guard seconds < Self.fallbackAhead else { return }
+            activity = "Mixing into \(candidates[0].title) as saved"
+            asked.insert(track.id)
+            Task {
+                do {
+                    _ = try await schedule(step.request)
+                } catch {
+                    activity = "The saved mix into \(candidates[0].title) could not be done: \(error.localizedDescription)"
+                }
+            }
+            return
+        }
+
         let mixOut = mixOutBeat(for: out, grid: grid)
         let seconds = (grid.time(atBeat: mixOut) - state.position) / max(0.25, state.speed)
 

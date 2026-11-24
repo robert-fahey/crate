@@ -19,6 +19,7 @@ struct CrateApp: App {
     @State private var startupError: String?
     @State private var shortcuts: DeckShortcuts?
     @AppStorage("decks.large") private var largeDecks = false
+    @AppStorage("sampler.shown") private var showsSampler = false
 
     var body: some Scene {
         Window("Crate", id: "main") {
@@ -45,6 +46,8 @@ struct CrateApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Add Folder to Library…") { model?.chooseFolder() }.keyboardShortcut("o")
                 Button("New Crate") { model?.newCrate() }.keyboardShortcut("n")
+                Divider()
+                Button("Ask the Agent") { model?.draft.focus() }.keyboardShortcut("k")
             }
             CommandMenu("Playback") {
                 // Space plays and pauses too, through DeckShortcuts, so that it still types a space in text fields.
@@ -55,6 +58,7 @@ struct CrateApp: App {
                 Button("Load Selection on Deck B") { model?.loadSelection(on: .b) }.keyboardShortcut(.rightArrow, modifiers: .command)
                 Divider()
                 Toggle("Large Decks", isOn: $largeDecks).keyboardShortcut("l", modifiers: [.command, .shift])
+                Toggle("Sampler", isOn: $showsSampler).keyboardShortcut("s", modifiers: [.command, .shift])
                 Divider()
                 Button("Auto DJ") { model?.director.isAuto.toggle() }
                 Button(model?.mixer.isRecording == true ? "Stop Recording" : "Record the Mix") { model?.mixer.toggleRecording() }

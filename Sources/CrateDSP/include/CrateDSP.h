@@ -95,4 +95,39 @@ void crate_clock_destroy(CrateClock *clock);
 void crate_clock_advance(CrateClock *clock, int32_t frames);  // audio thread
 int64_t crate_clock_frames(CrateClock *clock);
 
+
+// MARK: Sampler
+//
+// Eight pads, each holding a short piece of audio that plays from its start when
+// the pad is hit. A pad hit again starts again; what was sounding fades out in a
+// few milliseconds rather than being cut. A pad can loop. The sampler has its own
+// level into the master mix and its own way to the headphones, like a deck.
+
+#define CRATE_SAMPLER_PADS 8
+
+typedef struct CrateSampler CrateSampler;
+
+typedef struct {
+    bool playing[CRATE_SAMPLER_PADS];
+    float progress[CRATE_SAMPLER_PADS];  // how far through its audio each pad is, 0...1
+} CrateSamplerSnapshot;
+
+CrateSampler *crate_sampler_create(double engineSampleRate);
+void crate_sampler_destroy(CrateSampler *sampler);
+
+// From one control thread at a time. Each returns false if the queue is full.
+// The audio is not copied: it must stay where it is for as long as the pad has it, and for
+// a moment after it is replaced (the sound in flight fades out of the old memory).
+bool crate_sampler_set_audio(CrateSampler *sampler, int32_t pad, const float *left, const float *right, int64_t frames, double sampleRate);
+bool crate_sampler_trigger(CrateSampler *sampler, int32_t pad);
+bool crate_sampler_stop(CrateSampler *sampler, int32_t pad);  // pad < 0: every pad
+bool crate_sampler_set_pad(CrateSampler *sampler, int32_t pad, double gain, bool loops);
+// master: level into the mix. cue: level to the headphones whatever the master level is.
+// monitor: how much of what goes to the mix the headphones hear as well.
+void crate_sampler_set_levels(CrateSampler *sampler, double master, double cue, double monitor);
+void crate_sampler_snapshot(CrateSampler *sampler, CrateSamplerSnapshot *out);
+
+// Audio thread. Writes `frames` samples to each buffer; the headphone pair may be NULL.
+void crate_sampler_render(CrateSampler *sampler, float *left, float *right, float *phonesLeft, float *phonesRight, int32_t frames);
+
 #endif
