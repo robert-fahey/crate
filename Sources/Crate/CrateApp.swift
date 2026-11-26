@@ -46,6 +46,9 @@ struct CrateApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("Add Folder to Library…") { model?.chooseFolder() }.keyboardShortcut("o")
                 Button("New Crate") { model?.newCrate() }.keyboardShortcut("n")
+                Button("Grab from TIDAL…") { model.map { $0.grab.open(crate: $0.currentCrate) } }
+                    .keyboardShortcut("t", modifiers: [.command, .shift])
+                Button("Export All Crates for rekordbox…") { model.map { $0.exportForRekordbox($0.crates) } }
                 Divider()
                 Button("Ask the Agent") { model?.draft.focus() }.keyboardShortcut("k")
             }

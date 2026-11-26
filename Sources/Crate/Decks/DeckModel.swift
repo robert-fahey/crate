@@ -32,7 +32,12 @@ final class DeckModel: Identifiable {
     /// Where the Cue button returns to.
     private(set) var cuePoint = 0.0
     /// Playing only because the Cue button is being held.
-    private(set) var isCueing = false
+    private(set) var isCueing = false {
+        didSet { if !isCueing { cueHold?.cancel(); cueHold = nil } }
+    }
+    /// How long Cue has to be held before the deck carries on by itself, in seconds.
+    static let cueHoldToPlay = 5.0
+    @ObservationIgnored private var cueHold: Task<Void, Never>?
     var problem: String?
 
     // Refreshed about twenty times a second from the engine.
@@ -41,8 +46,11 @@ final class DeckModel: Identifiable {
     /// A better grid arrived from analysis while the deck was playing; it is taken up when the deck stops.
     @ObservationIgnored private var gridIsWaiting = false
     private(set) var loop: ClosedRange<Double>?
-    /// Output level 0...1, falling back gently between peaks.
+    /// The channel's level before its fader, 0...1, falling back steadily between peaks.
     private(set) var level: Float = 0
+    /// The same as the lights of the channel's meter.
+    private(set) var meter = MeterLights()
+    @ObservationIgnored private var ballistics = MeterBallistics()
     /// Speed set by the tempo fader or by Sync; 1 is as recorded.
     private(set) var tempo = 1.0
     /// How far from the master's beat, in beats; nil unless synced and locked.
@@ -169,6 +177,7 @@ final class DeckModel: Identifiable {
         Task.detached(priority: .userInitiated) { fetched.audio.decode(from: fetched.file) }
 
         self.track = track
+        mixer?.sampler?.trackLanded(track, on: id)
         gridUndo = []
         gridRedo = []
         transients = []
@@ -245,10 +254,15 @@ final class DeckModel: Identifiable {
 
     // MARK: Refresh from the engine
 
-    func poll() {
+    /// `elapsed` is how long ago the last refresh was, in seconds: the meter falls by the clock.
+    func poll(elapsed: Double) {
         let state = deck.state()
+        // Read even when it is not shown, so that what is shown next starts from now.
+        let loudest = deck.takeLevel()
         guard track != nil else {
             if level != 0 { level = 0 }
+            if meter != MeterLights() { meter = MeterLights() }
+            ballistics.reset()
             return
         }
         // Assign only what changed: every assignment redraws whatever reads it.
@@ -261,9 +275,10 @@ final class DeckModel: Identifiable {
             }
         }
         if loop != state.loop { loop = state.loop }
-        let peak = min(1, state.peak)
-        let shown = max(peak, level * 0.8)
-        if abs(shown - level) > 0.003 { level = shown }
+        ballistics.feed(loudest, after: elapsed)
+        let shown = min(1, ballistics.level)
+        if abs(shown - level) > 0.003 || (shown == 0 && level != 0) { level = shown }
+        if meter != ballistics.lights { meter = ballistics.lights }
         let speed = deck.value(of: .tempo)
         if abs(tempo - speed) > 0.00005 { tempo = speed }
         let error = mixer?.sync.phaseError(for: id)
@@ -334,6 +349,7 @@ final class DeckModel: Identifiable {
     /// The Cue button going down, as on a CDJ. While playing it goes back to the cue
     /// point and stops. While stopped it moves the cue point to where the deck is, if
     /// it is not there already, and plays from it for as long as the button is held.
+    /// Held for more than five seconds, the deck carries on when the button is let go.
     func cueDown() {
         guard track != nil, arriving == nil, !isCueing else { return }
         let wasPlaying = deck.state().isPlaying
@@ -341,6 +357,13 @@ final class DeckModel: Identifiable {
         guard !wasPlaying else { return }
         play()
         isCueing = isPlaying
+        guard isCueing else { return }
+        cueHold = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.cueHoldToPlay))
+            guard !Task.isCancelled, let self, self.isCueing else { return }
+            // No longer "playing only because Cue is held": letting go now changes nothing.
+            self.isCueing = false
+        }
     }
 
     /// Cue without the hold, which is what the agent asks for: back to the cue point and
@@ -358,7 +381,7 @@ final class DeckModel: Identifiable {
     }
 
     /// The Cue button let go: back to the cue point and stopped, unless Play was
-    /// pressed meanwhile, in which case the deck carries on.
+    /// pressed meanwhile or the button was held long enough, in which case the deck carries on.
     func cueUp() {
         guard isCueing else { return }
         pause()
@@ -461,12 +484,18 @@ final class DeckModel: Identifiable {
 
     // MARK: Hot cues
 
-    /// Jumps to a hot cue, or sets it here if the pad is empty. A saved loop goes there and goes round.
+    /// Jumps to a hot cue and plays from it, starting the deck if it was stopped, or sets the cue
+    /// here if the pad is empty. A saved loop goes there and goes round. A cue with no loop takes
+    /// the deck out of whatever loop it is in: the pad means "play on from here", and a loop left
+    /// on would pull the deck back round, or catch it when it next reached the loop's end.
     func hotCue(_ slot: Int) {
         guard track != nil else { return }
         if let cue = cuePoints[slot] {
+            if cue.loopEnd == nil { deck.endLoop() }
             jump(to: cue.position)
             if let end = cue.loopEnd { setLoop(from: cue.position, to: end) }
+            // Not while another track is on its way: Play would then mean that one.
+            if arriving == nil, !deck.state().isPlaying { play() }
         } else {
             setCuePoint(CuePoint(slot: slot, position: snapped(deck.state().position)))
         }
@@ -728,8 +757,11 @@ final class DJMixer {
     /// Cues, loops and jumps land on beats.
     var snap = true
     private(set) var masterDeck: DeckID?
+    /// The master mix as it goes into the limiter, the louder of left and right; over 1 is over full scale.
     private(set) var masterLevel: Float = 0
-    /// Lit for a moment when the master output hit full scale and the limiter stepped in.
+    /// The lights of the master meter, left and right.
+    private(set) var masterMeters = [MeterLights(), MeterLights()]
+    /// On for a moment after the mix went over full scale and the limiter had to hold it back.
     private(set) var isClipping = false
     private(set) var isRecording = false
     private(set) var recordedSeconds = 0.0
@@ -739,10 +771,13 @@ final class DJMixer {
     /// Called when a deck plays off the end of its track.
     @ObservationIgnored var onDeckEnded: ((DeckID) -> Void)?
     /// Called after every refresh from the engine.
-    @ObservationIgnored var onPoll: (() -> Void)?
+    @ObservationIgnored private var pollWatchers: [() -> Void] = []
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var wasPlaying = [false, false]
-    @ObservationIgnored private var clipHold = 0
+    @ObservationIgnored private var masterBallistics = [MeterBallistics(), MeterBallistics()]
+    @ObservationIgnored private var lastPoll: TimeInterval?
+    /// For scripted checks, which play in silence: levels for the master meter to show instead of the mix's own.
+    @ObservationIgnored var masterPeaksForTesting: (left: Float, right: Float)?
     @ObservationIgnored private var analysing: Set<Track.ID> = []
     @ObservationIgnored private var lastLoaded: DeckID = .b
 
@@ -764,10 +799,13 @@ final class DJMixer {
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
-        sampler = SamplerModel(sampler: engine.sampler, store: store, mixer: self)
+        sampler = SamplerModel(sampler: engine.sampler, syncer: SamplerSync(engine: engine, decks: sync), store: store, mixer: self)
     }
 
     func deck(_ id: DeckID) -> DeckModel { decks[id.rawValue] }
+
+    /// Has `action` called after every refresh from the engine, about twenty times a second.
+    func afterEachPoll(_ action: @escaping () -> Void) { pollWatchers.append(action) }
 
     /// Starts the audio engine if nothing has yet: the sampler can be the first thing to make a sound.
     func startEngine() {
@@ -870,7 +908,11 @@ final class DJMixer {
     }
 
     func poll() {
-        for deck in decks { deck.poll() }
+        // The timer is not exact, least of all while the window is busy: the meters go by the clock.
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsed = lastPoll.map { now - $0 } ?? 0.05
+        lastPoll = now
+        for deck in decks { deck.poll(elapsed: elapsed) }
         sampler.poll()
         let cross = engine.settings.crossfader
         if abs(crossfader - cross) > 0.002 {
@@ -881,11 +923,16 @@ final class DJMixer {
         let master = sync.currentMaster
         if masterDeck != master { masterDeck = master }
 
-        let peak = min(1.2, engine.takeMasterPeak())
-        let shown = max(peak, masterLevel * 0.8)
-        if abs(shown - masterLevel) > 0.003 { masterLevel = shown }
-        if peak >= 0.999 { clipHold = 20 } else if clipHold > 0 { clipHold -= 1 }
-        if isClipping != (clipHold > 0) { isClipping = clipHold > 0 }
+        let measured = engine.takeMasterPeaks()
+        let peaks = masterPeaksForTesting ?? measured
+        masterBallistics[0].feed(peaks.left, after: elapsed)
+        masterBallistics[1].feed(peaks.right, after: elapsed)
+        let shown = max(masterBallistics[0].level, masterBallistics[1].level)
+        if abs(shown - masterLevel) > 0.003 || (shown == 0 && masterLevel != 0) { masterLevel = shown }
+        let lights = masterBallistics.map(\.lights)
+        if masterMeters != lights { masterMeters = lights }
+        let over = masterBallistics.contains(where: \.isOver)
+        if isClipping != over { isClipping = over }
         if isRecording { recordedSeconds = engine.recordedSeconds }
 
         for deck in decks {
@@ -893,7 +940,7 @@ final class DJMixer {
             if wasPlaying[index], !deck.isPlaying, deck.deck.state().isEnded { onDeckEnded?(deck.id) }
             wasPlaying[index] = deck.isPlaying
         }
-        onPoll?()
+        for watcher in pollWatchers { watcher() }
     }
 
     // MARK: Recording

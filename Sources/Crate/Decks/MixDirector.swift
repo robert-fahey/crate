@@ -46,7 +46,7 @@ final class MixDirector {
         self.player = player
         self.store = store
         runner = TransitionRunner(engine: mixer.engine, sync: mixer.sync)
-        mixer.onPoll = { [weak self] in self?.poll() }
+        mixer.afterEachPoll { [weak self] in self?.poll() }
     }
 
     // MARK: Following the runner

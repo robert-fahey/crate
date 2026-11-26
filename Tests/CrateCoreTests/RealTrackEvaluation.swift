@@ -35,6 +35,44 @@ final class RealTrackEvaluation: XCTestCase {
     }
 }
 
+/// Not a pass/fail test: where the bar finder puts beat 1 on a real library, against the grids stored there.
+/// Run with CRATE_EVAL_DB=/path/to/library.sqlite swift test --filter RealBarEvaluation
+final class RealBarEvaluation: XCTestCase {
+    func testBarStartsOnRealTracks() throws {
+        guard let path = ProcessInfo.processInfo.environment["CRATE_EVAL_DB"] else { throw XCTSkip("set CRATE_EVAL_DB to run") }
+        let store = try LibraryStore(path: path)
+        var query = TrackQuery()
+        query.source = .local
+        let limit = Int(ProcessInfo.processInfo.environment["CRATE_EVAL_LIMIT"] ?? "") ?? 1000
+        for track in try store.tracks(query).prefix(limit) {
+            guard let grid = try store.beatGrid(id: track.id) else { continue }
+            // CRATE_EVAL_AUDIO is a folder of tracks already decoded to 11025 Hz mono, 16 bits, as NumPy files named by track id.
+            let audio: (samples: [Float], sampleRate: Double)
+            if let folder = ProcessInfo.processInfo.environment["CRATE_EVAL_AUDIO"] {
+                guard let data = FileManager.default.contents(atPath: "\(folder)/\(track.id).npy"), data.count > 12 else { continue }
+                let header = 10 + Int(data[8]) + Int(data[9]) << 8
+                let samples = data.withUnsafeBytes { bytes in
+                    stride(from: header, to: data.count - 1, by: 2).map { Float(bytes.loadUnaligned(fromByteOffset: $0, as: Int16.self)) / 32768 }
+                }
+                audio = (samples, 11025)
+            } else {
+                guard let file = Volumes.resolvedPath(for: track) else { continue }
+                let decoded = try AudioAnalyzer.decode(path: file)
+                audio = (decoded.samples, decoded.sampleRate)
+            }
+            let measures = BarFinder.measures(beats: grid.beats, samples: audio.samples, sampleRate: audio.sampleRate)
+            let boundaries = BarFinder.boundaries(measures)
+            let start = BarFinder.firstLoudBeat(measures)
+            let scores = BarFinder.scores(measures, boundaries: boundaries, start: start)
+            let found = BarFinder.find(grid: grid, samples: audio.samples, sampleRate: audio.sampleRate)
+            print(String(
+                format: "BARS %d | new %d phrase %d | stored %d | backbeat %+.3f | start %d | boundaries %d | scores %@ | %@",
+                track.id, found.downbeat, found.phrase, grid.downbeat % 4, BarFinder.backbeat(measures, from: grid.downbeat % 4), start ?? -1,
+                boundaries.count, scores.map { String(format: "%.2f", $0) }.joined(separator: " "), String(track.title.prefix(30))))
+        }
+    }
+}
+
 /// Renders a synced blend of two real tracks to a WAV file and measures how well their drums line up.
 /// CRATE_EVAL_DB=… CRATE_EVAL_MIX=/path/out.wav CRATE_EVAL_A="title" CRATE_EVAL_B="title" swift test --filter RealMixEvaluation
 final class RealMixEvaluation: XCTestCase {

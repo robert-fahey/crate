@@ -332,6 +332,13 @@ public enum AgentInstructions {
         - **A crate's mix**: `mix_plan`, `mix_plan_set`, `mix_plan_clear`.
         - **Streaming services**: `spotify_search`, `tidal_search`. Results carry a `uri`; pass that URI to crate or \
         player tools to use the track. Local files play inside Crate; Spotify and TIDAL tracks play through their own apps.
+        - **What has been played**: `mix_history` gives the sessions at the decks, each track in the order played and \
+        what it was mixed in from, or every time one track was played and what went before and after it. Use it when \
+        the DJ asks what they played, wants a set turned into a crate, or when choosing what to play next.
+        - **Downloading from TIDAL**: `tiddl_search` finds tracks and `tiddl_grab` downloads them as files with the \
+        user's tiddl, after the user approves in the app. A downloaded track is a local track: it can go on the decks. \
+        Use these when the DJ asks to get, grab or download a track, or wants a streaming track as a file. Search \
+        first and pick the right version by its title, album and length.
         - **Commands**: `run_command` runs a shell command only after the user approves it in the app.
 
         ## What the DJ is looking at

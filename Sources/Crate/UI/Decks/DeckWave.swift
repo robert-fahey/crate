@@ -9,6 +9,9 @@ final class WaveMotion {
     var isHovering = false
     var onScroll: ((NSEvent) -> Void)?
     private(set) var display = 0.0
+    /// The loop the deck was going round when the wave was last drawn, and how many times it had been round.
+    private(set) var loop: ClosedRange<Double>?
+    private(set) var pass = 0
 
     private var lastDate: Date?
     private var born: Date?
@@ -17,10 +20,10 @@ final class WaveMotion {
     private var level: CGFloat = 0
     private var monitor: Any?
 
-    /// - Parameters:
-    ///   - position: where the deck is now, in seconds.
-    ///   - speed: how fast it is moving, so ordinary playback is told apart from a jump.
-    func advance(to date: Date, position: Double, speed: Double, level raw: CGFloat, reduceMotion: Bool) -> WaveFrame {
+    /// - Parameter state: where the deck is now and how fast it is moving, which tells ordinary
+    ///   playback from a jump, and the loop it is going round.
+    func advance(to date: Date, state: DeckState, level raw: CGFloat, reduceMotion: Bool) -> WaveFrame {
+        let position = state.position, speed = state.speed
         let elapsed = lastDate.map { min(0.1, max(0, date.timeIntervalSince($0))) } ?? 0
         if born == nil {
             born = date
@@ -31,8 +34,17 @@ final class WaveMotion {
         // The deck moving at its own speed is followed exactly. A jump (a seek, a cue)
         // becomes a short glide, so the wave rushes to the new place instead of cutting.
         let expected = lastTarget + elapsed * speed
-        let jump = position - expected
-        if abs(jump) > 0.2 + abs(speed) * 0.05 { glide -= jump }
+        var jump = position - expected
+        let allowed = 0.2 + abs(speed) * 0.05
+        // Going round a loop is not a jump: the wave is drawn unrolled and scrolls straight on.
+        // The count of passes starts again with a new loop.
+        let rounds = state.loopPass - (state.loop == loop ? pass : 0)
+        if let length = state.loop.map({ $0.upperBound - $0.lowerBound }), rounds != 0, abs(jump + Double(rounds) * length) <= allowed {
+            jump += Double(rounds) * length
+        }
+        loop = state.loop
+        pass = state.loopPass
+        if abs(jump) > allowed { glide -= jump }
         glide *= exp(-elapsed * 11)
         if abs(glide) < 0.004 || reduceMotion { glide = 0 }
         lastTarget = position
@@ -41,7 +53,7 @@ final class WaveMotion {
         let follow = raw > level ? 1 - exp(-elapsed * 45) : 1 - exp(-elapsed * 7)
         level += (raw - level) * CGFloat(follow)
         let age = reduceMotion ? 10 : date.timeIntervalSince(born ?? date)
-        return WaveFrame(position: display, level: reduceMotion ? 0 : level, age: age)
+        return WaveFrame(position: display, level: reduceMotion ? 0 : level, age: age, loop: loop, pass: pass)
     }
 
     func startWatchingScroll() {
@@ -76,8 +88,7 @@ private struct MovingWave: View {
         // 60 frames a second is plenty, and the drawing itself happens off the main thread.
         TimelineView(.animation(minimumInterval: 1.0 / 60, paused: !isActive)) { timeline in
             let state = deck.state()
-            let frame = motion.advance(
-                to: timeline.date, position: state.position, speed: state.speed, level: level, reduceMotion: reduceMotion)
+            let frame = motion.advance(to: timeline.date, state: state, level: level, reduceMotion: reduceMotion)
             Canvas(rendersAsynchronously: true) { context, size in
                 WaveRenderer.draw(
                     &context, size: size, detail: detail, frame: frame, pointsPerSecond: pointsPerSecond, duration: duration,
@@ -164,7 +175,12 @@ struct DeckWaveView: View {
                 SpatialTapGesture().onEnded { tap in
                     // Only a stopped deck jumps on a click: a stray click must not move a deck that is playing out.
                     guard !deck.isPlaying else { return }
-                    deck.jump(to: motion.display + (tap.location.x - geometry.size.width / 2) / pointsPerSecond)
+                    // Round a loop the wave shows its passes one after another: the click is on the track under it.
+                    let place = motion.display + (tap.location.x - geometry.size.width / 2) / pointsPerSecond
+                    deck.jump(
+                        to: WaveUnroll.time(
+                            at: place, reach: WaveRenderer.reach(width: geometry.size.width, pointsPerSecond: pointsPerSecond),
+                            loop: motion.loop, pass: motion.pass))
                     stayAwake()
                 }
             )

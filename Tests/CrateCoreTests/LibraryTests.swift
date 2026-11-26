@@ -360,3 +360,122 @@ final class TrackSortingTests: XCTestCase {
         XCTAssertNil(TrackSorting.description(of: [KeyPathComparator(\Track.artist)]))
     }
 }
+
+final class RekordboxExportTests: XCTestCase {
+    func testAGridBecomesOneTempoForEachStretchBetweenMarkers() {
+        // A drum machine: one tempo from the first beat, which here is the third of its bar.
+        let steady = BeatGrid(bpm: 120, firstBeat: 0.25, duration: 60, downbeat: 2).withMarkers()
+        XCTAssertEqual(Rekordbox.tempos(steady), [Rekordbox.Tempo(start: 0.25, bpm: 120, beatInBar: 3)])
+
+        // A band that speeds up at beat 16: 120 for eight seconds, then 125.
+        let slower: [Double] = (0..<16).map { 0.5 + Double($0) * 0.5 }
+        let faster: [Double] = (0..<17).map { 8.5 + Double($0) * 0.48 }
+        let beats = slower + faster
+        let tempos = Rekordbox.tempos(BeatGrid(beats: beats, downbeat: 0).withMarkers(tolerance: 0.002))
+        XCTAssertEqual(tempos.count, 2)
+        XCTAssertEqual(tempos[0].start, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(tempos[0].bpm, 120, accuracy: 1e-6)
+        XCTAssertEqual(tempos[1].start, 8.5, accuracy: 1e-9)
+        XCTAssertEqual(tempos[1].bpm, 125, accuracy: 1e-6)
+        XCTAssertEqual(tempos.map(\.beatInBar), [1, 1])
+
+        // rekordbox has no time before the file starts: a grid that does begins on its first beat inside it.
+        let early = BeatGrid(bpm: 120, firstBeat: 0.1, duration: 30).shifted(by: -0.3).withMarkers()
+        let late = Rekordbox.tempos(early)
+        XCTAssertEqual(late.count, 1)
+        XCTAssertEqual(late.first?.start ?? 0, 0.3, accuracy: 1e-9)
+        XCTAssertEqual(late.first?.bpm ?? 0, 120, accuracy: 1e-6)
+        XCTAssertEqual(late.first?.beatInBar, 2)
+    }
+
+    func testKeysTemposAndAddressesAreWrittenAsRekordboxWritesThem() {
+        XCTAssertEqual(["8A", "8B", "11A", "3B", "2A", "6B"].compactMap(CamelotKey.init(parsing:)).map(Rekordbox.keyName), ["Am", "C", "F#m", "Db", "Ebm", "Bb"])
+        XCTAssertEqual(Rekordbox.bpmText(120), "120.00")
+        XCTAssertEqual(Rekordbox.bpmText(117.1375), "117.1375")
+        XCTAssertEqual(Rekordbox.bpmText(123.4567891), "123.456789")
+        XCTAssertEqual(
+            Rekordbox.location(path: "/Volumes/Music Drive/Café Tacvba & Friends/01 - 100% (Don't Stop).flac"),
+            "file://localhost/Volumes/Music%20Drive/Caf%C3%A9%20Tacvba%20%26%20Friends/01%20-%20100%25%20%28Don%27t%20Stop%29.flac")
+    }
+
+    func testCratesAreExportedAsPlaylistsWithGridsCuesAndLoops() throws {
+        let store = try LibraryStore(path: ":memory:")
+        let love = try store.upsertLocal(ScannedFile(
+            path: "/music/Loleatta Holloway/Love Sensation.flac", title: "Love <Sensation>", artist: "Loleatta \"Lolly\" Holloway",
+            album: "Queen of the Night", duration: 366.4, bpm: 117.1, key: "8A", format: "flac", size: 41_000_000))
+        let fire = try store.upsertLocal(ScannedFile(
+            path: "/music/Dan Hartman/Relight My Fire.mp3", title: "Relight My Fire", artist: "Dan Hartman", duration: 222, bpm: 120,
+            key: "7A", format: "mp3", size: 9_000_000))
+        let stream = try store.upsertStreaming(
+            source: .tidal, uri: "tidal:track:1", title: "Somewhere Else", artist: "Nobody", album: "", duration: 200)
+        try store.setBeatGrid(id: love, BeatGrid(bpm: 117.1, firstBeat: 0.31, duration: 366.4, downbeat: 1).withMarkers(), edited: false)
+        try store.setCuePoints(id: love, [
+            CuePoint(slot: 1, position: 13.2, name: "Start"), CuePoint(slot: 3, position: 75.5),
+            CuePoint(slot: 7, position: 13.2, name: "Intro & loop", loopEnd: 21.398),
+        ])
+        let disco = try store.createCrate(name: "Disco & Mix")
+        _ = try store.addToCrate(id: disco.id, trackIDs: [fire, stream, love])
+        let other = try store.createCrate(name: "Other")
+        _ = try store.addToCrate(id: other.id, trackIDs: [love])
+
+        // One crate: its playlist at the top, in the crate's order, without the track that has no file.
+        let one = try store.rekordboxExport(crates: [disco])
+        XCTAssertEqual(one.tracks, 2)
+        XCTAssertEqual(one.leftOut.map(\.title), ["Somewhere Else"])
+        let document = try XMLDocument(xmlString: one.xml)
+        let root = try XCTUnwrap(document.rootElement())
+        XCTAssertEqual(root.name, "DJ_PLAYLISTS")
+        XCTAssertEqual(root.attribute(forName: "Version")?.stringValue, "1.0.0")
+        let collection = try XCTUnwrap(root.elements(forName: "COLLECTION").first)
+        XCTAssertEqual(collection.attribute(forName: "Entries")?.stringValue, "2")
+        let tracks = collection.elements(forName: "TRACK")
+        func value(_ element: XMLElement, _ name: String) -> String? { element.attribute(forName: name)?.stringValue }
+        XCTAssertEqual(tracks.map { value($0, "Name") }, ["Relight My Fire", "Love <Sensation>"])
+        let track = tracks[1]
+        XCTAssertEqual(value(track, "TrackID"), "\(love)")
+        XCTAssertEqual(value(track, "Artist"), "Loleatta \"Lolly\" Holloway")
+        XCTAssertEqual(value(track, "Kind"), "FLAC File")
+        XCTAssertEqual(value(track, "Size"), "41000000")
+        XCTAssertEqual(value(track, "TotalTime"), "366")
+        XCTAssertEqual(value(track, "AverageBpm"), "117.10")
+        XCTAssertEqual(value(track, "Tonality"), "Am")
+        XCTAssertEqual(value(track, "Location"), "file://localhost/music/Loleatta%20Holloway/Love%20Sensation.flac")
+        XCTAssertEqual(value(tracks[0], "Kind"), "MP3 File")
+        XCTAssertTrue(tracks[0].elements(forName: "TEMPO").isEmpty, "no grid, so rekordbox is left to make one")
+
+        let tempo = try XCTUnwrap(track.elements(forName: "TEMPO").first)
+        XCTAssertEqual(track.elements(forName: "TEMPO").count, 1)
+        XCTAssertEqual(value(tempo, "Inizio"), "0.310")
+        XCTAssertEqual(Double(value(tempo, "Bpm") ?? "") ?? 0, 117.1, accuracy: 1e-5)
+        XCTAssertEqual(value(tempo, "Metro"), "4/4")
+        XCTAssertEqual(value(tempo, "Battito"), "4", "the bar starts on the second beat, so the first is the fourth of a bar")
+
+        let marks = track.elements(forName: "POSITION_MARK")
+        XCTAssertEqual(marks.map { value($0, "Num") }, ["0", "2", "6"], "pad 1 is hot cue A")
+        XCTAssertEqual(marks.map { value($0, "Type") }, ["0", "0", "4"])
+        XCTAssertEqual(marks.map { value($0, "Name") }, ["Start", "", "Intro & loop"])
+        XCTAssertEqual(marks.map { value($0, "Start") }, ["13.200", "75.500", "13.200"])
+        XCTAssertEqual(marks.map { value($0, "End") }, [nil, nil, "21.398"])
+
+        let top = try XCTUnwrap(root.elements(forName: "PLAYLISTS").first?.elements(forName: "NODE").first)
+        XCTAssertEqual(value(top, "Name"), "ROOT")
+        XCTAssertEqual(value(top, "Count"), "1")
+        let playlist = try XCTUnwrap(top.elements(forName: "NODE").first)
+        XCTAssertEqual(value(playlist, "Name"), "Disco & Mix")
+        XCTAssertEqual(value(playlist, "Type"), "1")
+        XCTAssertEqual(value(playlist, "Entries"), "2")
+        XCTAssertEqual(playlist.elements(forName: "TRACK").map { value($0, "Key") }, ["\(fire)", "\(love)"])
+
+        // Several crates: in a folder, and a track in two of them is in the collection once.
+        let all = try store.rekordboxExport(crates: try store.crates())
+        XCTAssertEqual(all.playlists, 2)
+        XCTAssertEqual(all.tracks, 2)
+        let folder = try XCTUnwrap(
+            try XMLDocument(xmlString: all.xml).rootElement()?.elements(forName: "PLAYLISTS").first?.elements(forName: "NODE").first?
+                .elements(forName: "NODE").first)
+        XCTAssertEqual(value(folder, "Type"), "0")
+        XCTAssertEqual(value(folder, "Name"), "Crate")
+        XCTAssertEqual(value(folder, "Count"), "2")
+        XCTAssertEqual(folder.elements(forName: "NODE").map { value($0, "Entries") }, ["2", "1"])
+    }
+}

@@ -33,6 +33,9 @@ struct MainView: View {
         .sheet(item: $model.editing) { track in
             TrackEditor(model: model, track: track)
         }
+        .sheet(isPresented: Binding(get: { model.grab.isShown }, set: { model.grab.isShown = $0 })) {
+            GrabSheet(grab: model.grab, model: model)
+        }
         .sheet(item: Binding(get: { model.agent.pendingCommand }, set: { _ in })) { request in
             CommandConfirmSheet(request: request) { approved in model.agent.resolveCommand(approved: approved) }
         }
@@ -52,6 +55,8 @@ struct MainView: View {
             }
             if model.stats.tracks == 0 {
                 EmptyLibraryView(model: model)
+            } else if model.sidebar == .history {
+                HistoryView(model: model)
             } else {
                 TrackTableView(model: model)
             }
@@ -79,6 +84,14 @@ struct MainView: View {
             }
             ToolbarItem {
                 Button {
+                    model.grab.open(crate: model.currentCrate)
+                } label: {
+                    Label("Grab from TIDAL", systemImage: "arrow.down.circle")
+                }
+                .help("Download tracks from TIDAL with tiddl and add them to the library")
+            }
+            ToolbarItem {
+                Button {
                     model.chooseFolder()
                 } label: {
                     Label("Add Folder", systemImage: "folder.badge.plus")
@@ -90,6 +103,11 @@ struct MainView: View {
 
     private var subtitle: String {
         if let activity = model.activity { return activity }
+        if model.sidebar == .history {
+            let plays = model.history.playCount, sessions = model.history.sessions.count
+            if plays == 0 { return "Nothing played yet" }
+            return "\(plays == 1 ? "1 track" : "\(plays) tracks") played in \(sessions == 1 ? "1 session" : "\(sessions) sessions")"
+        }
         let count = model.tracks.count
         let total = model.tracks.reduce(0) { $0 + $1.duration }
         let hours = Int(total) / 3600, minutes = Int(total) % 3600 / 60
@@ -117,6 +135,7 @@ struct SidebarView: View {
                 Label("Recently Added", systemImage: "clock").tag(SidebarItem.recent)
                 Label("To Tag", systemImage: "tag").badge(model.stats.needsTagging)
                     .tag(SidebarItem.needsTagging)
+                Label("Mix History", systemImage: "clock.arrow.circlepath").tag(SidebarItem.history)
             }
             Section("Crates") {
                 ForEach(model.crates) { crate in
@@ -140,6 +159,7 @@ struct SidebarView: View {
                                 newName = crate.name
                                 renaming = crate
                             }
+                            Button("Export for rekordbox…") { model.exportForRekordbox([crate]) }
                             if model.sharing.isOn {
                                 Toggle("Keep on This Mac", isOn: Binding(get: { crate.keepHere }, set: { model.setKeepHere(crate, $0) }))
                             }
@@ -347,6 +367,16 @@ struct TrackTableView: View {
             if tracks.contains(where: { model.away[$0.id] != nil }) {
                 Button("Copy to This Mac") { model.copyToThisMac(tracks) }
             }
+            // A TIDAL track is a known track: it can be downloaded as it is. Anything else that has no
+            // file here is looked for on TIDAL first.
+            let streamed = tracks.filter { $0.source == .tidal }
+            let fileless = tracks.filter { $0.source == .spotify || model.unavailable.contains($0.id) }
+            if !streamed.isEmpty {
+                Button(streamed.count == 1 ? "Grab from TIDAL" : "Grab \(streamed.count) from TIDAL") { model.grab.grab(streaming: streamed) }
+            }
+            if !fileless.isEmpty {
+                Button("Find on TIDAL to Grab…") { model.grab.open(finding: fileless, crate: model.currentCrate) }
+            }
             Divider()
             Menu("Ask the Agent") {
                 // The same offers the agent bar makes for a selection. The tracks are selected first, since
@@ -365,9 +395,13 @@ struct TrackTableView: View {
             }
             if tracks.count == 1, first.source == .local {
                 Menu("Send to Sampler") {
-                    ForEach(model.mixer.sampler.pads) { pad in
-                        Button(pad.isLoaded ? "Pad \(pad.id + 1) (replaces “\(pad.name)”)" : "Pad \(pad.id + 1)") {
-                            model.sendToSampler(trackID: first.id, pad: pad.id)
+                    ForEach(DeckID.allCases) { deck in
+                        Section("Deck \(deck.name): \(model.mixer.sampler.bank(on: deck)?.name ?? "")") {
+                            ForEach(model.mixer.sampler.pads(of: deck)) { pad in
+                                Button(pad.isLoaded ? "Pad \(pad.slot + 1) (replaces “\(pad.name)”)" : "Pad \(pad.slot + 1)") {
+                                    model.sendToSampler(trackID: first.id, pad: pad.id)
+                                }
+                            }
                         }
                     }
                 }

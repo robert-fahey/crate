@@ -71,11 +71,17 @@ struct CrateDeck {
     double lastStep;
     bool loopOn;
     double loopStart, loopEnd;
+    int64_t loopWraps;
+    double travel;
     double fadePosition, fadeStep;  // the old place, still sounding while a jump crossfades
     int fadeLeft;
     double gate;
     bool ended;
     float peak;
+    // The loudest sample before the fader since the meter was last read, as the bits of a float.
+    // Bits and not a float so that it can be raised and taken atomically; a level is never negative,
+    // so its bits are in the same order as its value.
+    _Atomic uint32_t meter;
 
     Biquad lowLP[2], lowHP[2], highLP[2], highHP[2];  // two sections each: 24 dB an octave
     double svf1[2], svf2[2];
@@ -215,6 +221,13 @@ void crate_deck_set_scratch_target(CrateDeck *deck, double position) {
     atomic_store_explicit(&deck->scratchTarget, position, memory_order_relaxed);
 }
 
+float crate_deck_take_level(CrateDeck *deck) {
+    uint32_t bits = atomic_exchange_explicit(&deck->meter, 0, memory_order_relaxed);
+    float level;
+    memcpy(&level, &bits, sizeof level);
+    return level;
+}
+
 void crate_deck_snapshot(CrateDeck *deck, CrateDeckSnapshot *out) {
     for (;;) {
         uint32_t before = atomic_load_explicit(&deck->sequence, memory_order_acquire);
@@ -240,9 +253,11 @@ static void apply(CrateDeck *deck, const CrateCommand *command) {
             deck->audio = deck->slots[command->param];
             deck->ratio = deck->audio.sampleRate > 0 ? deck->audio.sampleRate / deck->fs : 1.0;
             deck->position = 0;
+            deck->travel = 0;
             deck->motor = deck->motorTarget = deck->motorStep = 0;
             deck->scratching = false;
             deck->loopOn = false;
+            deck->loopWraps = 0;
             deck->fadeLeft = 0;
             deck->ended = false;
             deck->pendingCount = 0;  // anything scheduled was for the previous track
@@ -250,6 +265,7 @@ static void apply(CrateDeck *deck, const CrateCommand *command) {
         break;
     case CrateCmdSeek:
         jump(deck, command->a);
+        deck->loopWraps = 0;
         deck->ended = false;
         break;
     case CrateCmdMotor:
@@ -267,15 +283,23 @@ static void apply(CrateDeck *deck, const CrateCommand *command) {
         deck->loopStart = command->a;
         deck->loopEnd = command->b;
         deck->loopOn = command->b > command->a + 1;
+        deck->loopWraps = 0;
         break;
     case CrateCmdLoopOff:
         deck->loopOn = false;
+        deck->loopWraps = 0;
         break;
     case CrateCmdRamp:
         if (command->param >= 0 && command->param < CrateParamCount) {
             Param *param = &deck->params[command->param];
             int64_t frames = command->b > 0 ? (int64_t)command->b : (int64_t)(0.012 * deck->fs);
             if (command->param == CrateParamEchoFrames) frames = 1;  // gliding the echo time bends its pitch
+            // A glide is there to keep a change from clicking. A deck that is making no sound has
+            // nothing to click, and gliding would have it start from the old value: a volume turned
+            // down before the first track is played must already be down when that track starts.
+            if (deck->motor == 0 && deck->motorTarget == 0 && !deck->scratching && deck->gate <= 1e-5 && deck->tailFrames <= 0) {
+                frames = 1;
+            }
             if (frames < 1) frames = 1;
             param->target = command->a;
             param->remaining = frames;
@@ -378,6 +402,7 @@ static void process(CrateDeck *deck, float *outLeft, float *outRight, float *pho
     const double gateOpen = 1.0 - exp(-1.0 / (0.00015 * deck->fs));  // open within a few samples
     const double gateClose = 1.0 - exp(-1.0 / (0.0015 * deck->fs));
     const double dampRate = 1.0 - exp(-2.0 * M_PI * 5000.0 / deck->fs);
+    float loudest = 0;
 
     for (int i = 0; i < count; i++) {
         for (int p = 0; p < CrateParamCount; p++) {
@@ -451,16 +476,22 @@ static void process(CrateDeck *deck, float *outLeft, float *outRight, float *pho
         }
 
         deck->position += step;
+        deck->travel += step;
         if (deck->loopOn && !deck->scratching) {
+            // Counted, so that whoever draws the deck can tell a trip round the loop from a jump.
             double length = deck->loopEnd - deck->loopStart;
             if (step > 0 && deck->position >= deck->loopEnd) {
+                deck->loopWraps += (int64_t)floor((deck->position - deck->loopStart) / length);
                 jump(deck, deck->loopStart + fmod(deck->position - deck->loopStart, length));
                 deck->fadePosition = deck->position + length;  // keep sounding what was just past the end
             } else if (step < 0 && deck->position < deck->loopStart) {
                 double past = fmod(deck->loopStart - deck->position, length);
+                deck->loopWraps -= (int64_t)floor((deck->loopStart - deck->position) / length) + 1;
                 jump(deck, deck->loopEnd - past);
                 deck->fadePosition = deck->position - length;
             }
+        } else if (deck->loopOn && deck->position < deck->loopStart) {
+            deck->loopWraps = 0;  // scratched back out of the loop: what is heard is the track before it
         }
         if (deck->position >= (double)deck->audio.frames && step > 0) {
             deck->position = (double)deck->audio.frames;
@@ -564,6 +595,14 @@ static void process(CrateDeck *deck, float *outLeft, float *outRight, float *pho
         }
         float level = fabsf(l) > fabsf(r) ? fabsf(l) : fabsf(r);
         if (level > deck->peak) deck->peak = level;
+        float pre = (float)(fabs(before[0]) > fabs(before[1]) ? fabs(before[0]) : fabs(before[1]));
+        if (pre > loudest) loudest = pre;
+    }
+    if (loudest > 0) {
+        uint32_t bits;
+        memcpy(&bits, &loudest, sizeof bits);
+        uint32_t held = atomic_load_explicit(&deck->meter, memory_order_relaxed);
+        while (bits > held && !atomic_compare_exchange_weak_explicit(&deck->meter, &held, bits, memory_order_relaxed, memory_order_relaxed)) {}
     }
 }
 
@@ -625,6 +664,8 @@ void crate_deck_render(CrateDeck *deck, float *left, float *right, float *phones
         .audioGeneration = deck->audio.generation,
         .loopStart = deck->loopStart,
         .loopEnd = deck->loopEnd,
+        .travel = deck->travel,
+        .loopWraps = deck->loopOn ? deck->loopWraps : 0,
         .peak = deck->peak,
         .playing = deck->motorTarget != 0,
         .ended = deck->ended,

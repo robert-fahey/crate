@@ -77,53 +77,75 @@ struct WaveFrame {
     var level: CGFloat = 0
     /// Seconds since this track's wave first appeared; drives the rise-in.
     var age = 10.0
+    /// The loop the deck is going round, and how many times it has been round it. With these the
+    /// loop is drawn unrolled, pass after pass, so the wave scrolls on where the deck drops back.
+    var loop: ClosedRange<Double>?
+    var pass = 0
 }
 
 enum WaveRenderer {
+    /// How many seconds either side of the playhead are drawn: half the width and a little over,
+    /// so that a flag just off the edge is not cut short.
+    static func reach(width: CGFloat, pointsPerSecond: Double) -> Double { (Double(width) / 2 + 24) / pointsPerSecond }
+
     static func draw(
         _ context: inout GraphicsContext, size: CGSize, detail: WaveDetail, frame: WaveFrame,
         pointsPerSecond: Double, duration: Double, marks: WaveMarks = WaveMarks(), waveOnly: Bool = false
     ) {
         let centerX = size.width / 2
         let middle = size.height / 2
-        let reach = middle - 9  // tallest half-height; leaves room for the ruler
+        let tallest = middle - 9  // tallest half-height; leaves room for the ruler
         let columnsPerSecond = detail.columnsPerSecond
         let pointsPerColumn = pointsPerSecond / columnsPerSecond
         // When zoomed out, several columns share a point: take the loudest of each group.
         let step = max(1, Int((1.4 / pointsPerColumn).rounded(.up)))
 
-        func x(atSeconds seconds: Double) -> CGFloat { centerX + CGFloat((seconds - frame.position) * pointsPerSecond) }
+        // Usually the one stretch of the track on screen; round a loop, each pass that is.
+        let segments = WaveUnroll.segments(
+            around: frame.position, reach: WaveRenderer.reach(width: size.width, pointsPerSecond: pointsPerSecond), loop: frame.loop,
+            pass: frame.pass)
+        func x(_ seconds: Double, in segment: WaveUnroll.Segment) -> CGFloat {
+            centerX + CGFloat((seconds + segment.shift - frame.position) * pointsPerSecond)
+        }
 
-        let firstVisible = Int(((frame.position - Double(centerX) / pointsPerSecond) * columnsPerSecond).rounded(.down))
-        let lastVisible = Int(((frame.position + Double(centerX) / pointsPerSecond) * columnsPerSecond).rounded(.up))
-        // Start on a multiple of the step so groups do not shift as the wave scrolls.
-        let first = max(0, (firstVisible / step - 1) * step)
-        let last = min(detail.count, lastVisible + step)
-
-        if first < last {
-            var xs: [CGFloat] = []
-            var heights: [[CGFloat]] = [[], [], []]
-            xs.reserveCapacity((last - first) / step + 2)
-            var column = first
-            while column < last {
-                let levels = step == 1
-                    ? (low: detail.level(.low, at: column), mid: detail.level(.mid, at: column), high: detail.level(.high, at: column))
-                    : detail.peak(in: column..<(column + step))
-                let position = x(atSeconds: (Double(column) + Double(step) / 2) / columnsPerSecond)
-                let distance = abs(position - centerX)
-                // The wave swells a little where it passes the playhead, in time with the music.
-                var scale = 1 + 0.28 * frame.level * exp(-(distance * distance) / 1800)
-                // A new track's wave rises outwards from the playhead and overshoots slightly.
-                if frame.age < 1.2 {
-                    scale *= riseIn((frame.age - Double(distance / max(1, centerX)) * 0.35) / 0.5)
-                }
-                xs.append(position)
-                heights[0].append(WavePalette.height(levels.low) * reach * scale)
-                heights[1].append(WavePalette.height(levels.mid) * reach * scale * 0.92)
-                heights[2].append(WavePalette.height(levels.high) * reach * scale * 0.74)
+        var xs: [CGFloat] = []
+        var heights: [[CGFloat]] = [[], [], []]
+        xs.reserveCapacity(Int(size.width / 1.4) + segments.count + 2)
+        func add(column: Int, at position: CGFloat) {
+            let levels = step == 1
+                ? (low: detail.level(.low, at: column), mid: detail.level(.mid, at: column), high: detail.level(.high, at: column))
+                : detail.peak(in: column..<min(detail.count, column + step))
+            let distance = abs(position - centerX)
+            // The wave swells a little where it passes the playhead, in time with the music.
+            var scale = 1 + 0.28 * frame.level * exp(-(distance * distance) / 1800)
+            // A new track's wave rises outwards from the playhead and overshoots slightly.
+            if frame.age < 1.2 {
+                scale *= riseIn((frame.age - Double(distance / max(1, centerX)) * 0.35) / 0.5)
+            }
+            xs.append(position)
+            heights[0].append(WavePalette.height(levels.low) * tallest * scale)
+            heights[1].append(WavePalette.height(levels.mid) * tallest * scale * 0.92)
+            heights[2].append(WavePalette.height(levels.high) * tallest * scale * 0.74)
+        }
+        for segment in segments {
+            // Groups start on a multiple of the step, so they do not shift as the wave scrolls, and a
+            // group is drawn in the segment its middle falls in, so the points run left to right.
+            let middleOffset = Double(step) / 2
+            var column = Int(((segment.from * columnsPerSecond - middleOffset) / Double(step)).rounded(.up)) * step
+            column = max(0, column)
+            let before = xs.count
+            while column < detail.count, (Double(column) + middleOffset) / columnsPerSecond < segment.to {
+                add(column: column, at: x((Double(column) + middleOffset) / columnsPerSecond, in: segment))
                 column += step
             }
-
+            if xs.count == before, segment.isPass {
+                // A pass narrower than a group still shows what is in it.
+                let time = (segment.from + segment.to) / 2
+                let within = Int(time * columnsPerSecond) / step * step
+                if within >= 0, within < detail.count { add(column: within, at: x(time, in: segment)) }
+            }
+        }
+        if xs.count > 1 {
             let colors = [WavePalette.low, WavePalette.mid, WavePalette.high]
             for band in 0..<3 {
                 let path = mirrored(xs: xs, heights: heights[band], middle: middle)
@@ -135,7 +157,7 @@ enum WaveRenderer {
                 context.fill(
                     path,
                     with: .linearGradient(
-                        gradient, startPoint: CGPoint(x: 0, y: middle - reach), endPoint: CGPoint(x: 0, y: middle + reach)))
+                        gradient, startPoint: CGPoint(x: 0, y: middle - tallest), endPoint: CGPoint(x: 0, y: middle + tallest)))
             }
         }
 
@@ -144,31 +166,61 @@ enum WaveRenderer {
         // The grid editor draws its own grid, markers and playhead over a plain wave.
         if waveOnly { return }
 
-        if let loop = marks.loop {
-            let from = x(atSeconds: loop.lowerBound), to = x(atSeconds: loop.upperBound)
+        let passes = segments.filter(\.isPass)
+        if let first = passes.first, let last = passes.last {
+            // Round a loop: one band over every pass. A strong line where the loop was first entered, and
+            // a fainter one where each later pass begins, unless they would crowd into a fence.
+            let from = x(first.from, in: first), to = x(last.to, in: last)
+            context.fill(Path(CGRect(x: from, y: 0, width: to - from, height: size.height)), with: .color(WaveMarks.loopColor.opacity(0.16)))
+            if let loop = frame.loop {
+                let length = loop.upperBound - loop.lowerBound
+                for pass in passes where pass.from <= loop.lowerBound {
+                    let isEntry = frame.pass >= 0 && abs(pass.shift + Double(frame.pass) * length) < length / 2
+                    guard isEntry || length * pointsPerSecond >= 12 else { continue }
+                    let edge = x(loop.lowerBound, in: pass)
+                    context.fill(
+                        Path(CGRect(x: edge - 0.75, y: 0, width: 1.5, height: size.height)),
+                        with: .color(WaveMarks.loopColor.opacity(isEntry ? 0.9 : 0.45)))
+                }
+            }
+        } else if let loop = marks.loop, let whole = segments.first {
+            let from = x(loop.lowerBound, in: whole), to = x(loop.upperBound, in: whole)
             context.fill(Path(CGRect(x: from, y: 0, width: to - from, height: size.height)), with: .color(WaveMarks.loopColor.opacity(0.16)))
             for edge in [from, to] {
                 context.fill(Path(CGRect(x: edge - 0.75, y: 0, width: 1.5, height: size.height)), with: .color(WaveMarks.loopColor.opacity(0.9)))
             }
         }
         if let grid = marks.grid {
-            beatLines(&context, size: size, grid: grid, frame: frame, pointsPerSecond: pointsPerSecond, x: x)
+            for segment in segments {
+                beatLines(&context, size: size, grid: grid, from: segment.from, to: segment.to, pointsPerSecond: pointsPerSecond) {
+                    x($0, in: segment)
+                }
+            }
         }
 
         // What has already played is dimmed.
         context.fill(Path(CGRect(x: 0, y: 0, width: centerX, height: size.height)), with: .color(WavePalette.screen.opacity(0.5)))
 
-        ruler(
-            &context, size: size, frame: frame, pointsPerSecond: pointsPerSecond, duration: duration,
-            ticks: marks.grid == nil, x: x)
-        cueFlags(&context, size: size, marks: marks, x: x)
+        for segment in segments {
+            ruler(
+                &context, size: size, from: segment.from, to: segment.to, pointsPerSecond: pointsPerSecond, duration: duration,
+                ticks: marks.grid == nil
+            ) { x($0, in: segment) }
+        }
+        if marks.cuePoint != nil || !marks.cues.isEmpty {
+            for segment in segments {
+                cueFlags(&context, size: size, marks: marks, from: segment.from, to: segment.to) { x($0, in: segment) }
+            }
+        }
 
         // The two ends of the track.
-        for edge in [0, duration] {
-            let position = x(atSeconds: edge)
-            if position > -2, position < size.width + 2 {
-                context.fill(
-                    Path(CGRect(x: position - 0.5, y: 6, width: 1, height: size.height - 12)), with: .color(.white.opacity(0.35)))
+        for segment in segments where !segment.isPass {
+            for edge in [0, duration] where edge >= segment.from && edge <= segment.to {
+                let position = x(edge, in: segment)
+                if position > -2, position < size.width + 2 {
+                    context.fill(
+                        Path(CGRect(x: position - 0.5, y: 6, width: 1, height: size.height - 12)), with: .color(.white.opacity(0.35)))
+                }
             }
         }
 
@@ -226,15 +278,13 @@ enum WaveRenderer {
     /// Ticks along the bottom with a time label every so often, so the scrolling
     /// is visible even through a quiet passage.
     private static func ruler(
-        _ context: inout GraphicsContext, size: CGSize, frame: WaveFrame, pointsPerSecond: Double,
+        _ context: inout GraphicsContext, size: CGSize, from: Double, to: Double, pointsPerSecond: Double,
         duration: Double, ticks: Bool, x: (Double) -> CGFloat
     ) {
         let tickEvery = [1.0, 2, 5, 10, 30].first { $0 * pointsPerSecond >= 14 } ?? 60
         let labelEvery = [1.0, 2, 5, 10, 15, 30, 60, 120].first { $0 * pointsPerSecond >= 170 && $0 >= tickEvery } ?? 300
-        let half = Double(size.width) / 2 / pointsPerSecond
-        var tick = (max(0, frame.position - half) / tickEvery).rounded(.up) * tickEvery
-        let end = min(duration, frame.position + half)
-        while tick <= end {
+        var tick = (max(0, from) / tickEvery).rounded(.up) * tickEvery
+        while tick < to, tick <= duration {
             let position = x(tick)
             let labelled = tick.truncatingRemainder(dividingBy: labelEvery) < 0.001
             if ticks {
@@ -254,16 +304,17 @@ enum WaveRenderer {
 }
 
 extension WaveRenderer {
-    /// A line on every beat, a stronger one at the start of each bar, and a marker where a phrase starts.
+    /// A line on every beat, a stronger one at the start of each bar, and a marker where a phrase starts,
+    /// for the beats from `from` up to, not including, `to`.
     static func beatLines(
-        _ context: inout GraphicsContext, size: CGSize, grid: BeatGrid, frame: WaveFrame, pointsPerSecond: Double,
+        _ context: inout GraphicsContext, size: CGSize, grid: BeatGrid, from: Double, to: Double, pointsPerSecond: Double,
         x: (Double) -> CGFloat
     ) {
-        let half = Double(size.width) / 2 / pointsPerSecond
-        let first = Int(grid.beatPosition(at: frame.position - half).rounded(.down))
-        let last = Int(grid.beatPosition(at: frame.position + half).rounded(.up))
-        guard last > first, last - first < 2000 else { return }
-        let spacing = size.width / CGFloat(last - first)
+        // A beat a hair before `from` counts as on it: a loop starts on a beat, give or take rounding.
+        let first = Int((grid.beatPosition(at: from) - 0.0001).rounded(.up))
+        let last = Int((grid.beatPosition(at: to) - 0.0001).rounded(.up)) - 1
+        guard last >= first, last - first < 2000 else { return }
+        let spacing = CGFloat((grid.time(atBeat: Double(first) + 1) - grid.time(atBeat: Double(first))) * pointsPerSecond)
         for beat in first...last {
             let position = x(grid.time(atBeat: Double(beat)))
             let inBar = grid.beatInBar(beat)
@@ -288,8 +339,10 @@ extension WaveRenderer {
         }
     }
 
-    static func cueFlags(_ context: inout GraphicsContext, size: CGSize, marks: WaveMarks, x: (Double) -> CGFloat) {
-        if let cue = marks.cuePoint {
+    static func cueFlags(
+        _ context: inout GraphicsContext, size: CGSize, marks: WaveMarks, from: Double, to: Double, x: (Double) -> CGFloat
+    ) {
+        if let cue = marks.cuePoint, cue >= from, cue < to {
             let position = x(cue)
             if position > -10, position < size.width + 10 {
                 var marker = Path()
@@ -300,7 +353,7 @@ extension WaveRenderer {
                 context.fill(marker, with: .color(.white))
             }
         }
-        for (slot, time) in marks.cues.sorted(by: { $0.key < $1.key }) {
+        for (slot, time) in marks.cues.sorted(by: { $0.key < $1.key }) where time >= from && time < to {
             let position = x(time)
             guard position > -20, position < size.width + 20 else { continue }
             let color = WaveMarks.color(forCue: slot)

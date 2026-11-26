@@ -253,7 +253,7 @@ private struct DeckControls: View {
                 .buttonStyle(TransportButtonStyle(isOn: deck.isCueing, colors: colors, size: 38) { down in
                     if down { deck.cueDown() } else { deck.cueUp() }
                 })
-                .help("Hold to play from the cue point; let go to return to it. While playing: back to the cue point and stop. Stopped somewhere else: sets the cue point there.")
+                .help("Hold to play from the cue point; let go to return to it, or keep holding for five seconds and the deck carries on. While playing: back to the cue point and stop. Stopped somewhere else: sets the cue point there.")
             Button { deck.togglePlay() } label: {
                 Image(systemName: deck.isPlaying ? "pause.fill" : "play.fill").font(.system(size: 15 * scale, weight: .black))
             }
@@ -355,7 +355,7 @@ private struct DeckControls: View {
     private func padHelp(_ slot: Int) -> String {
         guard let cue = deck.cuePoints[slot] else { return "Set hot cue \(slot) here" }
         let name = cue.name.isEmpty ? "hot cue \(slot)" : "“\(cue.name)”"
-        return cue.isLoop ? "Go to \(name) and loop it. Right-click to clear or edit." : "Jump to \(name). Right-click to clear or edit."
+        return cue.isLoop ? "Play \(name) as a loop. Right-click to clear or edit." : "Play from \(name). Right-click to clear or edit."
     }
 
     private var effects: some View {
@@ -412,21 +412,27 @@ private struct MixerCenter: View {
     @AppStorage("sampler.shown") private var showsSampler = false
     @Environment(\.deckScale) private var scale
 
+    // Nothing in here changes size with what it shows: a label that changes, a note that appears
+    // or a recording's running time moves nothing else. The faders and meters take whatever height
+    // the decks beside the mixer leave; everything under them is a fixed row.
     var body: some View {
         VStack(spacing: 8 * scale) {
-            HStack(alignment: .center, spacing: 7 * scale) {
-                channel(mixer.deck(.a))
-                VStack(spacing: 4 * scale) {
-                    HStack(spacing: 2.5 * scale) {
-                        LevelMeter(level: mixer.masterLevel)
-                        LevelMeter(level: mixer.masterLevel)
-                    }
-                    .frame(height: 96 * scale)
-                    Text(mixer.isClipping ? "CLIP" : "MASTER")
-                        .font(.system(size: 8 * scale, weight: .heavy, design: .rounded)).tracking(1)
-                        .foregroundStyle(mixer.isClipping ? Color.red : Color.white.opacity(0.45))
+            VStack(spacing: 3 * scale) {
+                HStack(spacing: 0) {
+                    channel(mixer.deck(.a))
+                    Spacer(minLength: 0)
+                    MasterMeter(mixer: mixer)
+                    Spacer(minLength: 0)
+                    channel(mixer.deck(.b))
                 }
-                channel(mixer.deck(.b))
+                .frame(minHeight: 110 * scale, idealHeight: 110 * scale, maxHeight: .infinity)
+                Text(mixer.isClipping ? "LIMIT" : "MASTER")
+                    .font(.system(size: 8 * scale, weight: .heavy, design: .rounded)).tracking(1)
+                    .foregroundStyle(mixer.isClipping ? Color(red: 1, green: 0.3, blue: 0.35) : Color.white.opacity(0.45))
+                    .frame(maxWidth: .infinity)
+                    .help(mixer.isClipping
+                        ? "The mix is over full scale and the limiter is holding it back. Turn a trim, a fader or the volume down."
+                        : "The master mix, left and right, in decibels below full scale. Red is over full scale, where the limiter holds it back.")
             }
             HStack(spacing: 6 * scale) {
                 Text("A").font(.system(size: 10 * scale, weight: .black, design: .rounded)).foregroundStyle(DeckStyle.color(0))
@@ -438,19 +444,12 @@ private struct MixerCenter: View {
                 Text("B").font(.system(size: 10 * scale, weight: .black, design: .rounded)).foregroundStyle(DeckStyle.color(1))
             }
             HStack(spacing: 5 * scale) {
-                Button { mixer.toggleRecording() } label: {
-                    HStack(spacing: 4 * scale) {
-                        Circle().fill(mixer.isRecording ? Color.white : Color(red: 1, green: 0.25, blue: 0.3)).frame(width: 7 * scale, height: 7 * scale)
-                        Text(mixer.isRecording ? TrackFormat.duration(mixer.recordedSeconds) : "REC").monospacedDigit()
-                    }
-                }
-                .buttonStyle(PadButtonStyle(isOn: mixer.isRecording, color: Color(red: 1, green: 0.25, blue: 0.3), minWidth: 52))
-                .help(mixer.isRecording ? "Stop recording" : "Record the mix to Music/Crate Recordings")
+                RecordButton(mixer: mixer)
                 Button("SNAP") { mixer.snap.toggle() }
-                    .buttonStyle(PadButtonStyle(isOn: mixer.snap, color: .white, minWidth: 42))
+                    .buttonStyle(PadButtonStyle(isOn: mixer.snap, color: .white, fills: true))
                     .help("Cues, loops and jumps land on beats")
                 Button("AUTO") { director.isAuto.toggle() }
-                    .buttonStyle(PadButtonStyle(isOn: director.isAuto, color: Color(red: 0.4, green: 1.0, blue: 0.85), minWidth: 42))
+                    .buttonStyle(PadButtonStyle(isOn: director.isAuto, color: Color(red: 0.4, green: 1.0, blue: 0.85), fills: true))
                     .help("Auto DJ: tracks that are up next are mixed in, chosen by the agent, instead of starting cold")
             }
             HStack(spacing: 5 * scale) {
@@ -460,30 +459,36 @@ private struct MixerCenter: View {
                     } label: {
                         Label(deck.id.name, systemImage: "headphones").labelStyle(.titleAndIcon)
                     }
-                    .buttonStyle(PadButtonStyle(isOn: deck.cueMonitor, color: DeckStyle.color(deck.id.rawValue), minWidth: 42))
-                    .help("Headphone cue: hear deck \(deck.id.name) in the headphones before its fader is up")
+                    .buttonStyle(PadButtonStyle(isOn: deck.cueMonitor, color: DeckStyle.color(deck.id.rawValue), fills: true))
+                    .help(headphoneHelp ?? "Headphone cue: hear deck \(deck.id.name) in the headphones before its fader is up")
+                    .disabled(!mixer.hasHeadphones)
+                    .opacity(mixer.hasHeadphones ? 1 : 0.4)
                 }
-                Knob(value: $mixer.headphoneMix, range: 0...1, resting: 0.5, label: "CUE·MIX", size: 24)
-                    .help("What the headphones hear: the cued decks at one end, the master mix at the other")
+                HStack(spacing: 5 * scale) {
+                    Button { showsSampler.toggle() } label: {
+                        Image(systemName: "square.grid.3x2.fill")
+                    }
+                    .buttonStyle(PadButtonStyle(isOn: showsSampler, color: .white, minWidth: 20, fills: true))
+                    .help(showsSampler ? "Hide the sampler" : "Show the sampler: eight pads for one-shot sounds and loops")
+                    Button { isLarge.toggle() } label: {
+                        Image(systemName: isLarge ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
+                    }
+                    .buttonStyle(PadButtonStyle(isOn: isLarge, color: .white, minWidth: 20, fills: true))
+                    .help(isLarge ? "Compact decks" : "Large decks: taller waveforms and bigger controls")
+                }
+                .frame(maxWidth: .infinity)
             }
-            .disabled(!mixer.hasHeadphones)
-            .opacity(mixer.hasHeadphones ? 1 : 0.4)
-            .help(mixer.hasHeadphones
-                ? "Headphones play through outputs 3-4 of \(mixer.outputName)"
-                : "Headphone cue needs a sound card with four outputs, such as a DJ controller's")
-            HStack(spacing: 8 * scale) {
-                Knob(value: $mixer.masterVolume, range: 0...1, resting: 1, label: "VOLUME", size: 30)
-                status.frame(maxWidth: .infinity, alignment: .leading)
-                Button { showsSampler.toggle() } label: {
-                    Image(systemName: "square.grid.3x2.fill")
-                }
-                .buttonStyle(PadButtonStyle(isOn: showsSampler, color: .white, minWidth: 26))
-                .help(showsSampler ? "Hide the sampler" : "Show the sampler: eight pads for one-shot sounds and loops")
-                Button { isLarge.toggle() } label: {
-                    Image(systemName: isLarge ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
-                }
-                .buttonStyle(PadButtonStyle(isOn: isLarge, color: .white, minWidth: 26))
-                .help(isLarge ? "Compact decks" : "Large decks: taller waveforms and bigger controls")
+            HStack(alignment: .center, spacing: 4 * scale) {
+                Knob(value: $mixer.headphoneMix, range: 0...1, resting: 0.5, label: "CUE·MIX", size: 30, width: 46)
+                    .help(headphoneHelp ?? "What the headphones hear: the cued decks at one end, the master mix at the other")
+                    .disabled(!mixer.hasHeadphones)
+                    .opacity(mixer.hasHeadphones ? 1 : 0.4)
+                status
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 42 * scale)
+                Knob(value: $mixer.masterVolume, range: 0...1, resting: 1, label: "VOLUME", size: 30, width: 46)
+                    .help("The volume of the master mix. Double-click for full.")
             }
         }
         .frame(width: 186 * scale)
@@ -491,24 +496,37 @@ private struct MixerCenter: View {
         .deckCard()
     }
 
+    /// Why the headphone controls are out of use, when they are.
+    private var headphoneHelp: String? {
+        mixer.hasHeadphones ? nil : "Headphone cue needs a sound card with four outputs, such as a DJ controller's"
+    }
+
+    /// What the mixer has to say, between the two knobs: a problem first, then the mix under way,
+    /// then what is up next, and otherwise where the sound is going. Always the same size.
     @ViewBuilder
     private var status: some View {
+        let font = Font.system(size: 9.5 * scale, weight: .medium, design: .rounded)
         if let note {
-            Text(note).font(.system(size: 10 * scale, weight: .medium, design: .rounded)).foregroundStyle(.orange).lineLimit(3)
+            Text(note).font(font).foregroundStyle(.orange).lineLimit(3).minimumScaleFactor(0.85).help(note)
         } else if let summary = director.summary {
-            HStack(spacing: 4) {
-                Text(summary).font(.system(size: 10 * scale, weight: .bold, design: .rounded))
-                    .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.85)).lineLimit(2)
+            VStack(spacing: 2 * scale) {
+                Text(summary).font(font.weight(.bold))
+                    .foregroundStyle(Color(red: 0.4, green: 1.0, blue: 0.85)).lineLimit(2).minimumScaleFactor(0.85).help(summary)
                 if director.isBusy {
                     Button { director.cancel() } label: { Image(systemName: "xmark") }
-                        .buttonStyle(PadButtonStyle(minWidth: 20, height: 20))
+                        .buttonStyle(PadButtonStyle(minWidth: 20, height: 16))
                         .help("Cancel this mix and take over by hand")
                 }
             }
         } else if let activity = director.activity, director.isAuto {
-            Text(activity).font(.system(size: 10 * scale, design: .rounded)).foregroundStyle(.secondary).lineLimit(3)
+            Text(activity).font(font).foregroundStyle(.secondary).lineLimit(3).minimumScaleFactor(0.85).help(activity)
         } else if !player.upNext.isEmpty {
-            Text("\(player.upNext.count) up next").font(.system(size: 10 * scale, weight: .medium, design: .rounded)).foregroundStyle(.secondary)
+            Text("\(player.upNext.count) up next").font(font).foregroundStyle(.secondary)
+        } else if !mixer.outputName.isEmpty {
+            Text(mixer.outputName).font(font).foregroundStyle(.white.opacity(0.32)).lineLimit(2).minimumScaleFactor(0.85)
+                .help("Playing through \(mixer.outputName). Change it in Settings > Audio.")
+        } else {
+            Color.clear
         }
     }
 
@@ -519,10 +537,53 @@ private struct MixerCenter: View {
     private func channel(_ deck: DeckModel) -> some View {
         @Bindable var deck = deck
         return HStack(spacing: 4 * scale) {
-            if deck.id == .b { LevelMeter(level: deck.level).frame(height: 96 * scale) }
+            if deck.id == .b { ChannelMeter(deck: deck) }
             VerticalFader(value: $deck.fader, colors: DeckStyle.colors(deck.id.rawValue), label: "Deck \(deck.id.name) volume")
-                .frame(height: 110 * scale)
-            if deck.id == .a { LevelMeter(level: deck.level).frame(height: 96 * scale) }
+                .help("Deck \(deck.id.name)'s volume in the mix")
+            if deck.id == .a { ChannelMeter(deck: deck) }
         }
+    }
+}
+
+// The meters and the record button are views of their own so that their changing, many times a
+// second, redraws them and not the whole mixer.
+
+/// A channel's level before its fader, so the two decks can be matched with TRIM before one is brought in.
+private struct ChannelMeter: View {
+    let deck: DeckModel
+    @Environment(\.deckScale) private var scale
+
+    var body: some View {
+        LevelMeter(lights: deck.meter)
+            // As tall as the fader's travel, so the two read against each other.
+            .padding(.vertical, 9 * scale)
+            .help("Deck \(deck.id.name)'s level before its fader. Match the two decks with TRIM; red is over full scale.")
+    }
+}
+
+private struct MasterMeter: View {
+    let mixer: DJMixer
+    @Environment(\.deckScale) private var scale
+
+    var body: some View {
+        StereoMeter(left: mixer.masterMeters[0], right: mixer.masterMeters[1])
+            .padding(.vertical, 9 * scale)
+    }
+}
+
+private struct RecordButton: View {
+    let mixer: DJMixer
+    @Environment(\.deckScale) private var scale
+
+    var body: some View {
+        let red = Color(red: 1, green: 0.25, blue: 0.3)
+        Button { mixer.toggleRecording() } label: {
+            HStack(spacing: 4 * scale) {
+                Circle().fill(mixer.isRecording ? Color.white : red).frame(width: 7 * scale, height: 7 * scale)
+                Text(mixer.isRecording ? TrackFormat.duration(mixer.recordedSeconds) : "REC").monospacedDigit()
+            }
+        }
+        .buttonStyle(PadButtonStyle(isOn: mixer.isRecording, color: red, fills: true))
+        .help(mixer.isRecording ? "Stop recording" : "Record the mix to Music/Crate Recordings")
     }
 }

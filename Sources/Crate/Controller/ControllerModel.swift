@@ -158,7 +158,7 @@ final class ControllerModel {
             set(.effect(id), deck.echoOn)
             let mode = padMode[id.rawValue]
             for kind in [PadMode.hotCue, .beatLoop, .beatJump, .sampler] { set(.padMode(id, kind), kind == mode) }
-            for pad in mixer.sampler.pads { set(.sample(id, pad.id), mode == .sampler && pad.isLoaded) }
+            for slot in 0..<SampleBank.size { set(.sample(id, slot), mode == .sampler && mixer.sampler.pads[Sampler.pad(slot, of: id)].isLoaded) }
             for slot in 1...8 { set(.hotCue(id, slot), mode == .hotCue && deck.cues[slot] != nil) }
             let length = deck.loop.flatMap { loop in deck.grid.map { $0.beatPosition(at: loop.upperBound) - $0.beatPosition(at: loop.lowerBound) } }
             for (index, beats) in DDJFLX4.Decoder.loopBeats.enumerated() {
@@ -261,7 +261,9 @@ final class ControllerModel {
         case .jump(let id, let beats): mixer.deck(id).jump(byBeats: beats)
 
         case .padMode(let id, let mode): padMode[id.rawValue] = mode
-        case .sample(let pad, let stop): if stop { mixer.sampler.stop(pad) } else { mixer.sampler.hit(pad) }
+        case .sample(let id, let slot, let stop):
+            let pad = Sampler.pad(slot, of: id)
+            if stop { mixer.sampler.stop(pad) } else { mixer.sampler.hit(pad) }
         case .hotCue(let id, let slot): mixer.deck(id).hotCue(slot)
         case .clearHotCue(let id, let slot): mixer.deck(id).clearHotCue(slot)
         case .beatLoop(let id, let beats):

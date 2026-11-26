@@ -566,8 +566,13 @@ final class AgentSession {
         case "player_next": return "Skipping"
         case "player_seek": return "Seeking"
         case "player_status": return "Checking what is playing"
+        case "mix_history": return arg("track") == nil ? "Reading the mix history" : "Looking up when a track was played"
         case "spotify_search": return "Searching Spotify" + (arg("query").map { " for “\($0)”" } ?? "")
         case "tidal_search": return "Searching TIDAL" + (arg("query").map { " for “\($0)”" } ?? "")
+        case "tiddl_search": return "Searching TIDAL" + (arg("query").map { " for “\($0)”" } ?? "")
+        case "tiddl_grab":
+            let count = args["tracks"]?.arrayValue?.count ?? 0
+            return "Downloading \(count == 1 ? "a track" : "\(count) tracks") from TIDAL"
         case "run_command": return "Command: \(arg("command") ?? "")"
         case "glob", "ls", "read", "grep": return "Looking at files"
         case "webSearch", "webFetch": return "Searching the web"

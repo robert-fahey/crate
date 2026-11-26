@@ -58,6 +58,8 @@ typedef struct {
     int64_t frame;           // engine frames this deck has rendered
     uint64_t audioGeneration;
     double loopStart, loopEnd;
+    double travel;           // source frames the record has turned through since the track went on; jumps do not count
+    int64_t loopWraps;       // times round the loop since it was set or the deck last jumped; negative going backwards
     float peak;              // loudest output sample in the last render
     bool playing;            // the motor is on or heading there
     bool ended;              // played off the end of the track
@@ -81,6 +83,10 @@ bool crate_deck_set_clicks(CrateDeck *deck, const double *positions, const uint8
 // Where the hand is holding the record while scratching, in source frames.
 void crate_deck_set_scratch_target(CrateDeck *deck, double position);
 void crate_deck_snapshot(CrateDeck *deck, CrateDeckSnapshot *out);
+// The loudest sample the deck has made before its fader (after trim, EQ, filter and echo) since
+// this was last called; 1 is full scale. Reading it starts the next measurement, so no peak is
+// missed however irregularly it is read. For one reader: the channel's level meter.
+float crate_deck_take_level(CrateDeck *deck);
 
 // Audio thread. `left` and `right` are the deck's part of the master mix. `phonesLeft` and
 // `phonesRight`, if not NULL, get its part of what the headphones hear: the deck before its
@@ -98,18 +104,24 @@ int64_t crate_clock_frames(CrateClock *clock);
 
 // MARK: Sampler
 //
-// Eight pads, each holding a short piece of audio that plays from its start when
+// Sixteen pads (a bank of eight for each deck), each holding a short piece of audio that plays from its start when
 // the pad is hit. A pad hit again starts again; what was sounding fades out in a
 // few milliseconds rather than being cut. A pad can loop. The sampler has its own
 // level into the master mix and its own way to the headphones, like a deck.
+// A hit can be given the frame to start on, where in the audio to start and a
+// speed, and the speed changed as it plays: that is how pads are kept in time
+// with the decks (SamplerSync, in Swift, does the deciding).
 
-#define CRATE_SAMPLER_PADS 8
+#define CRATE_SAMPLER_PADS 16
 
 typedef struct CrateSampler CrateSampler;
 
 typedef struct {
-    bool playing[CRATE_SAMPLER_PADS];
-    float progress[CRATE_SAMPLER_PADS];  // how far through its audio each pad is, 0...1
+    int64_t frame;                        // engine frames the sampler has rendered
+    double position[CRATE_SAMPLER_PADS];  // where each sounding pad is in its audio, in source frames, as of `frame`
+    float progress[CRATE_SAMPLER_PADS];   // how far through its audio each pad is, 0...1
+    bool playing[CRATE_SAMPLER_PADS];     // sounding, or hit and waiting for its frame
+    bool sounding[CRATE_SAMPLER_PADS];
 } CrateSamplerSnapshot;
 
 CrateSampler *crate_sampler_create(double engineSampleRate);
@@ -120,6 +132,14 @@ void crate_sampler_destroy(CrateSampler *sampler);
 // a moment after it is replaced (the sound in flight fades out of the old memory).
 bool crate_sampler_set_audio(CrateSampler *sampler, int32_t pad, const float *left, const float *right, int64_t frames, double sampleRate);
 bool crate_sampler_trigger(CrateSampler *sampler, int32_t pad);
+// Plays a pad from `position` (source frames) at `rate` (1 = as recorded), starting on frame
+// `atFrame` of the sampler's own count; 0 is straight away. If that frame has gone by when the
+// audio thread gets to it, a pad that loops starts as far in as it would have reached: late, but
+// in time. One that does not loop starts where it was told to, so that it is heard whole.
+// A start part-way through the audio is faded in over a few milliseconds.
+bool crate_sampler_trigger_at(CrateSampler *sampler, int32_t pad, int64_t atFrame, double position, double rate);
+// Changes the speed of a pad as it plays. The next hit sets it again.
+bool crate_sampler_set_rate(CrateSampler *sampler, int32_t pad, double rate);
 bool crate_sampler_stop(CrateSampler *sampler, int32_t pad);  // pad < 0: every pad
 bool crate_sampler_set_pad(CrateSampler *sampler, int32_t pad, double gain, bool loops);
 // master: level into the mix. cue: level to the headphones whatever the master level is.

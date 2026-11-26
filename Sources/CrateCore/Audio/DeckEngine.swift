@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import CrateDSP
 import Foundation
@@ -48,10 +49,15 @@ public final class DeckEngine: @unchecked Sendable {
     /// Each deck's frame count minus the output's, as it stood with no pitch shifter in the path.
     private var offsetBaselines: [Int64] = [0, 0]
     private var needsBaseline = [false, false]
+    private var samplerOffsetCandidate: Int64?
     private var configurationObserver: NSObjectProtocol?
     private var recording: AVAudioFile?
     private var recordedFrames: Int64 = 0
-    private var peakSinceRead: Float = 0
+    /// The loudest sample of the master's left and right since they were last read, if anything
+    /// has been measured since; and the latest measurement, with when it was made.
+    private var peaksSinceRead: [Float]?
+    private var latestPeaks: [Float] = [0, 0]
+    private var latestPeaksAt: TimeInterval = 0
     private var tickHandlers: [() -> Void] = []
     private var deviceChannels = 2
     private var chosenDevice: AudioDeviceID?
@@ -153,6 +159,7 @@ public final class DeckEngine: @unchecked Sendable {
         let outputFormat = Self.format(sampleRate: rate)
         engine.connect(engine.mainMixerNode, to: limiter, format: outputFormat)
         engine.connect(limiter, to: engine.outputNode, format: outputFormat)
+        installMeterTap()
         guard let device else {
             lock.withLock { deviceChannels = 4 }  // offline, the headphone pair is simply rendered
             return
@@ -245,6 +252,19 @@ public final class DeckEngine: @unchecked Sendable {
         }
     }
 
+    /// The same for the sampler, which is wired straight to the mix: how its frame count stands to the output's.
+    private func measureSamplerOffset() {
+        let before = crate_clock_frames(clock)
+        let frame = sampler.snapshot().frame
+        guard crate_clock_frames(clock) == before else { return }
+        let offset = frame - before
+        let confirmed = lock.withLock { () -> Bool in
+            defer { samplerOffsetCandidate = offset }
+            return samplerOffsetCandidate == offset
+        }
+        if confirmed, sampler.frameOffset != offset { sampler.frameOffset = offset }
+    }
+
     public func deck(_ id: DeckID) -> Deck { decks[id.rawValue] }
 
     /// Starts the audio hardware if it is not running. Safe from any thread: decks call it
@@ -308,18 +328,40 @@ public final class DeckEngine: @unchecked Sendable {
 
     // MARK: Master level and recording
 
-    /// Listens to what leaves the limiter: for the master meter, and for recording.
+    /// Listens to the mix as it goes into the limiter, for the master meter. Measured there and not
+    /// after it, so the meter can show how far over full scale the mix is being pushed: what comes
+    /// out of the limiter never is. Put back whenever the output is reconnected, as its format may have changed.
+    private func installMeterTap() {
+        engine.mainMixerNode.removeTap(onBus: 0)
+        engine.mainMixerNode.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
+            guard let self, let data = buffer.floatChannelData else { return }
+            // The master is the first pair; the headphones' pair is not metered.
+            let channels = min(2, Int(buffer.format.channelCount))
+            guard channels > 0 else { return }
+            var peaks: [Float] = [0, 0]
+            for channel in 0..<channels {
+                var peak: Float = 0
+                vDSP_maxmgv(data[channel], 1, &peak, vDSP_Length(buffer.frameLength))
+                peaks[channel] = peak
+            }
+            if channels == 1 { peaks[1] = peaks[0] }
+            let now = ProcessInfo.processInfo.systemUptime
+            self.lock.withLock {
+                let held = self.peaksSinceRead ?? [0, 0]
+                self.peaksSinceRead = [max(held[0], peaks[0]), max(held[1], peaks[1])]
+                self.latestPeaks = peaks
+                self.latestPeaksAt = now
+            }
+        }
+    }
+
+    /// Listens to what leaves the limiter, for recording.
     private func installOutputTap() {
         limiter.installTap(onBus: 0, bufferSize: 2048, format: nil) { [weak self] buffer, _ in
             guard let self, let data = buffer.floatChannelData else { return }
-            // The master is the first pair; the headphones' pair is neither metered nor recorded.
+            // The master is the first pair; the headphones' pair is not recorded.
             let masterChannels = min(2, Int(buffer.format.channelCount))
-            var peak: Float = 0
-            for channel in 0..<masterChannels {
-                for frame in 0..<Int(buffer.frameLength) { peak = max(peak, abs(data[channel][frame])) }
-            }
             let file: AVAudioFile? = self.lock.withLock {
-                self.peakSinceRead = max(self.peakSinceRead, peak)
                 if self.recording != nil { self.recordedFrames += Int64(buffer.frameLength) }
                 return self.recording
             }
@@ -334,12 +376,29 @@ public final class DeckEngine: @unchecked Sendable {
         }
     }
 
-    /// The loudest master output sample since this was last read, linear. 1.0 is full scale.
-    public func takeMasterPeak() -> Float {
-        lock.withLock {
-            defer { peakSinceRead = 0 }
-            return peakSinceRead
+    /// The loudest sample of the master mix, left and right, since this was last read. 1.0 is full
+    /// scale; more than that is the mix being pushed into the limiter. Reading starts the next
+    /// measurement, so no peak is missed however irregularly it is read.
+    ///
+    /// The mix is handed over for measuring a tenth of a second at a time, which is less often
+    /// than a meter asks. Asked again before the next piece has come, this gives the latest
+    /// measurement again rather than silence: a steady sound reads steady. With no piece for
+    /// a third of a second the output has stopped, and that is silence.
+    public func takeMasterPeaks() -> (left: Float, right: Float) {
+        let now = ProcessInfo.processInfo.systemUptime
+        return lock.withLock {
+            if let peaks = peaksSinceRead {
+                peaksSinceRead = nil
+                return (peaks[0], peaks[1])
+            }
+            return now - latestPeaksAt < 0.3 ? (latestPeaks[0], latestPeaks[1]) : (0, 0)
         }
+    }
+
+    /// The louder of the two.
+    public func takeMasterPeak() -> Float {
+        let peaks = takeMasterPeaks()
+        return max(peaks.left, peaks.right)
     }
 
     /// Records the master output to a 16-bit WAV file until `stopRecording`.
@@ -382,6 +441,7 @@ public final class DeckEngine: @unchecked Sendable {
     /// One control step: stops decks that have run off the end, then runs the tick handlers (sync, automation).
     public func tick() {
         measureLeads()
+        measureSamplerOffset()
         for deck in decks {
             let state = deck.state()
             if state.isEnded { deck.pause() }

@@ -13,10 +13,12 @@ import Foundation
 /// 3. The attacks are smoothed over a few bars, so one ghost note or missing
 ///    drum does not bend the grid. If the result is evenly spaced, the grid is
 ///    made exactly even.
+///
+/// Which of the beats start bars is a separate question, answered by `BarFinder`.
 public enum BeatTracker {
     /// Raised whenever the tracker gets better at its job, so grids it made earlier are made again.
     /// Grids corrected by hand are left alone.
-    public static let version = 2
+    public static let version = 3
     /// How strongly beats are held to the expected spacing.
     static let tightness: Float = 100
     /// How far from the first-pass beat an attack is looked for, in seconds.
@@ -38,7 +40,7 @@ public enum BeatTracker {
         guard bpm > 20, sampleRate > 0 else { return nil }
         // Music with a fixed tempo gets a grid that is a ruler; counting its beats one by one only invites mistakes.
         if var grid = SteadyTempo.grid(samples: samples, sampleRate: sampleRate, bpm: bpm)?.grid {
-            let bars = barPhase(grid: grid, samples: samples, sampleRate: sampleRate)
+            let bars = BarFinder.find(grid: grid, samples: samples, sampleRate: sampleRate)
             grid.downbeat = bars.downbeat
             grid.phrase = bars.phrase
             return grid
@@ -89,7 +91,7 @@ public enum BeatTracker {
         }
         // Reduce the beats to markers, as an editor would place them.
         var grid = BeatGrid(beats: beats, isSteady: refined.isSteady).withMarkers(tolerance: markerTolerance)
-        let bars = barPhase(grid: grid, samples: samples, sampleRate: sampleRate)
+        let bars = BarFinder.find(grid: grid, samples: samples, sampleRate: sampleRate)
         grid.downbeat = bars.downbeat
         grid.phrase = bars.phrase
         return grid
@@ -271,42 +273,5 @@ public enum BeatTracker {
             level[index] = running
         }
         return level
-    }
-
-    // MARK: Bars and phrases
-
-    /// Guesses which beats start bars and phrases: sections of a track nearly
-    /// always change on the first beat of a bar, and usually every 8 or 16 bars.
-    static func barPhase(grid: BeatGrid, samples: [Float], sampleRate: Double) -> (downbeat: Int, phrase: Int) {
-        let beats = grid.beats
-        guard beats.count > 40 else { return (0, 0) }
-        // Loudness of each beat.
-        var energy = [Float](repeating: 0, count: beats.count - 1)
-        for index in 0..<(beats.count - 1) {
-            let from = max(0, Int(beats[index] * sampleRate)), to = min(samples.count, Int(beats[index + 1] * sampleRate))
-            guard from < to else { continue }
-            var sum: Float = 0
-            vDSP_svesq(Array(samples[from..<to]), 1, &sum, vDSP_Length(to - from))
-            energy[index] = (sum / Float(to - from)).squareRoot()
-        }
-        // How much the music changes at each beat: the four bars after against the four before.
-        let span = 16
-        var change = [Float](repeating: 0, count: energy.count)
-        for index in span..<max(span, energy.count - span) {
-            let before = energy[(index - span)..<index].reduce(0, +)
-            let after = energy[index..<(index + span)].reduce(0, +)
-            change[index] = abs(after - before) / max(1e-6, after + before)
-        }
-        func best(every step: Int, candidates: [Int]) -> Int {
-            candidates.max { first, second in
-                stride(from: first, to: change.count, by: step).reduce(Float(0)) { $0 + change[$1] }
-                    < stride(from: second, to: change.count, by: step).reduce(Float(0)) { $0 + change[$1] }
-            } ?? 0
-        }
-        let downbeat = best(every: BeatGrid.beatsPerBar, candidates: Array(0..<BeatGrid.beatsPerBar))
-        let phrase = best(
-            every: BeatGrid.beatsPerPhrase,
-            candidates: Array(stride(from: downbeat, to: BeatGrid.beatsPerPhrase, by: BeatGrid.beatsPerBar)))
-        return (downbeat, phrase)
     }
 }

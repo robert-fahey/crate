@@ -1,3 +1,4 @@
+import Accelerate
 import AVFoundation
 import CrateDSP
 import Foundation
@@ -21,20 +22,42 @@ public struct SampleClip: @unchecked Sendable {
     }
 
     public var duration: Double { Double(range.count) / audio.sampleRate }
+
+    /// The clip's outline for drawing: the loudest sample in each of `bins` equal stretches,
+    /// scaled so that the loudest of all is 1.
+    public func peaks(bins: Int) -> [Float] {
+        guard bins > 0, !range.isEmpty else { return [] }
+        var peaks = [Float](repeating: 0, count: bins)
+        for bin in 0..<bins {
+            let from = range.lowerBound + range.count * bin / bins, to = range.lowerBound + range.count * (bin + 1) / bins
+            guard to > from else { continue }
+            vDSP_maxmgv(audio.left + from, 1, &peaks[bin], vDSP_Length(to - from))
+        }
+        let loudest = peaks.max() ?? 0
+        return loudest > 0 ? peaks.map { $0 / loudest } : peaks
+    }
 }
 
-/// The sampler: eight pads that each play a short piece of audio when hit.
+/// The sampler: sixteen pads that each play a short piece of audio when hit, a bank of eight
+/// for each deck. Pad `deck * 8 + slot` is that deck's pad `slot`.
 ///
 /// The playing is done on the audio thread by C code; this is the handle on it.
 public final class Sampler: @unchecked Sendable {
     public static let padCount = Int(CRATE_SAMPLER_PADS)
+    /// The pad that is `slot` (0...7) of a deck's bank.
+    public static func pad(_ slot: Int, of deck: DeckID) -> Int { deck.rawValue * SampleBank.size + slot }
     /// The longest piece of audio a pad takes, in seconds. A sampler is for hits and loops, not whole tracks.
     public static let longest = 120.0
 
     public struct PadState: Equatable, Sendable {
+        /// Sounding, or hit and waiting for the beat it starts on.
         public var isPlaying = false
+        /// Sound is coming out of it.
+        public var isSounding = false
         /// How far through its audio the pad is, 0...1.
         public var progress = 0.0
+        /// Seconds into its audio.
+        public var position = 0.0
     }
 
     let node: AVAudioSourceNode
@@ -43,6 +66,7 @@ public final class Sampler: @unchecked Sendable {
     private var clips: [SampleClip?]
     private var gains: [Double]
     private var loops: [Bool]
+    private var offset: Int64 = 0
 
     init(sampleRate: Double) {
         guard let core = crate_sampler_create(sampleRate) else { fatalError("out of memory creating the sampler") }
@@ -95,10 +119,26 @@ public final class Sampler: @unchecked Sendable {
         lock.withLock { isPad(pad) ? clips[pad] : nil }
     }
 
-    /// Plays a pad from its start. Hit again while sounding, it starts again.
-    public func trigger(_ pad: Int) {
+    /// Plays a pad. Hit again while sounding, it starts again.
+    ///
+    /// - Parameters:
+    ///   - seconds: where in its audio to start. Anywhere but the top is faded in.
+    ///   - rate: its speed; 1 is as recorded.
+    ///   - frame: the frame of the sampler's own count (`snapshot().frame`) to start on; 0 is straight
+    ///     away. A frame that has gone by still comes out in time for a pad that loops: it starts as far
+    ///     in as it would have got. A one-shot starts where it was told to, late but whole.
+    public func trigger(_ pad: Int, from seconds: Double = 0, rate: Double = 1, at frame: Int64 = 0) {
         guard isPad(pad) else { return }
-        lock.withLock { _ = crate_sampler_trigger(core, Int32(pad)) }
+        lock.withLock {
+            let sourceRate = clips[pad]?.audio.sampleRate ?? 0
+            _ = crate_sampler_trigger_at(core, Int32(pad), frame, max(0, seconds) * sourceRate, rate > 0 ? rate : 1)
+        }
+    }
+
+    /// Changes the speed of a pad as it plays; 1 is as recorded. The next hit sets it again.
+    public func setRate(_ rate: Double, on pad: Int) {
+        guard isPad(pad), rate > 0 else { return }
+        lock.withLock { _ = crate_sampler_set_rate(core, Int32(pad), rate) }
     }
 
     /// Stops a pad, or every pad with nil. The sound fades over a few milliseconds.
@@ -116,16 +156,36 @@ public final class Sampler: @unchecked Sendable {
         }
     }
 
+    /// Whether a pad goes round and round until stopped.
+    public func loops(on pad: Int) -> Bool { lock.withLock { isPad(pad) && loops[pad] } }
+
     /// The sampler's level into the mix and its way to the headphones; the engine sets these from the mixer.
     func setLevels(master: Double, cue: Double, monitor: Double) {
         crate_sampler_set_levels(core, master, cue, monitor)
     }
 
-    public func state() -> [PadState] {
+    public func state() -> [PadState] { snapshot().pads }
+
+    /// What every pad is doing, as of `frame` of the sampler's own count of the frames it has rendered.
+    public func snapshot() -> (frame: Int64, pads: [PadState]) {
         var snapshot = CrateSamplerSnapshot()
         crate_sampler_snapshot(core, &snapshot)
         let playing = withUnsafeBytes(of: snapshot.playing) { Array($0.bindMemory(to: Bool.self)) }
+        let sounding = withUnsafeBytes(of: snapshot.sounding) { Array($0.bindMemory(to: Bool.self)) }
         let progress = withUnsafeBytes(of: snapshot.progress) { Array($0.bindMemory(to: Float.self)) }
-        return (0..<Self.padCount).map { PadState(isPlaying: playing[$0], progress: Double(progress[$0])) }
+        let position = withUnsafeBytes(of: snapshot.position) { Array($0.bindMemory(to: Double.self)) }
+        let rates = lock.withLock { clips.map { $0?.audio.sampleRate ?? 0 } }
+        return (snapshot.frame, (0..<Self.padCount).map {
+            PadState(
+                isPlaying: playing[$0], isSounding: sounding[$0], progress: Double(progress[$0]),
+                position: rates[$0] > 0 ? position[$0] / rates[$0] : 0)
+        })
+    }
+
+    /// The sampler's frame count minus the engine's output frame: a start meant to be heard at
+    /// output frame T is asked for at T + frameOffset. Measured by the engine.
+    public var frameOffset: Int64 {
+        get { lock.withLock { offset } }
+        set { lock.withLock { offset = newValue } }
     }
 }

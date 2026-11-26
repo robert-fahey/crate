@@ -7,6 +7,8 @@ enum SidebarItem: Hashable {
     case all
     case recent
     case needsTagging
+    /// What has been played, session by session.
+    case history
     case source(TrackSource)
     case crate(Int64)
 }
@@ -39,6 +41,10 @@ final class AppModel {
     let spotify: SpotifyAPI
     let tidal: TidalAPI
     let sharing: SharingModel
+    /// Getting tracks from TIDAL with tiddl.
+    let grab: GrabModel
+    /// What has been played on the decks.
+    let history: HistoryModel
     @ObservationIgnored private(set) var controller: ControllerModel!
     /// Counts moves of the selection made from a controller, so the list can keep the selected row in view.
     private(set) var browseMoves = 0
@@ -81,6 +87,8 @@ final class AppModel {
     /// What was left unsent in each conversation's text field.
     @ObservationIgnored private var drafts: [ConversationID: String] = [:]
     @ObservationIgnored private var analysisTask: Task<Void, Never>?
+    /// Tracks arrived while an analysis run was under way: go round again when it ends.
+    @ObservationIgnored private var analysisWanted = false
     @ObservationIgnored private var fingerprintTask: Task<Void, Never>?
 
     init(store: LibraryStore) {
@@ -89,6 +97,7 @@ final class AppModel {
         mixer = DJMixer(store: store)
         player = PlayerController(store: store, mixer: mixer)
         director = MixDirector(mixer: mixer, player: player, store: store)
+        history = HistoryModel(store: store, mixer: mixer, player: player)
         agent = AgentSession(store: store, registry: registry)
 
         let context = LibraryToolContext(store: store, scanner: scanner, catalog: StreamingCatalog())
@@ -96,6 +105,7 @@ final class AppModel {
         PlayerTools.register(into: registry, context: context, player: player)
         DeckTools.register(into: registry, context: context, mix: director)
         CueTools.register(into: registry, context: context)
+        HistoryTools.register(into: registry, context: context)
         MixPlanTools.register(into: registry, context: context)
         director.agent = agent
         // CRATE_DB marks a test run: keep it away from the real keychain.
@@ -103,12 +113,31 @@ final class AppModel {
         spotify = SpotifyAPI(secrets: secrets)
         tidal = TidalAPI(secrets: secrets)
         sharing = SharingModel(store: store, secrets: secrets)
+        let grabber = TrackGrabber(store: store, scanner: scanner)
+        grab = GrabModel(store: store, grabber: grabber)
         let sharing = self.sharing
         mixer.fetchFile = { track, note in try await sharing.fetch(track, note: note) }
         sharing.onChange = { [weak self] in self?.refreshAvailability() }
         ServiceTools.register(into: registry, context: context, spotify: spotify, tidal: tidal)
         let agent = self.agent
         CommandTool.register(into: registry) { request in await agent.requestApproval(request) }
+        let grab = self.grab
+        // A download the agent asks for is approved in the app first, as its commands are.
+        GrabTools.register(
+            into: registry, context: context, grabber: grabber, tiddl: { await grab.installed() },
+            options: { await grab.options() }, approve: { request in await agent.requestApproval(request) },
+            imported: { [weak self] in await self?.analyzePending() })
+        grab.report = { [weak self] text in
+            self?.activity = text
+            // What a grab came to is news for a moment, not a standing state.
+            guard let text, text.hasPrefix("From TIDAL") else { return }
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(8))
+                if self?.activity == text { self?.activity = nil }
+            }
+        }
+        grab.imported = { [weak self] in self?.analyzePending() }
+        grab.announce = { [weak self] text in self?.alert = text }
 
         NotificationCenter.default.addObserver(
             forName: .libraryDidChange, object: store, queue: nil
@@ -203,11 +232,13 @@ final class AppModel {
             query.ascending = false
             query.limit = 100
         case .needsTagging: query.needsTagging = true
+        case .history: history.reload()
         case .source(let source): query.source = source
         case .crate(let id): query.crateID = id
         }
         do {
-            var loaded = try store.tracks(query)
+            // The history has a list of its own; the track list is empty while it shows.
+            var loaded = sidebar == .history ? [] : try store.tracks(query)
             // A crate keeps its own order and "recent" its date order until a column header is clicked.
             let keepsStoreOrder: Bool
             switch sidebar {
@@ -268,6 +299,7 @@ final class AppModel {
         case .all: return "All Tracks"
         case .recent: return "Recently Added"
         case .needsTagging: return "To Tag"
+        case .history: return "Mix History"
         case .source(let source): return source.displayName
         case .crate(let id): return crates.first { $0.id == id }?.name ?? "Crate"
         }
@@ -352,6 +384,16 @@ final class AppModel {
         browseMoves += 1
     }
 
+    /// Shows tracks that have just arrived: the newest first, with them selected.
+    func show(_ tracks: [Track]) {
+        guard !tracks.isEmpty else { return }
+        if !searchText.isEmpty { searchText = "" }
+        let ids = Set(tracks.map(\.id))
+        if !ids.isSubset(of: Set(self.tracks.map(\.id))) { sidebar = .recent }
+        selection = ids.intersection(Set(self.tracks.map(\.id)))
+        browseMoves += 1
+    }
+
     // MARK: Library
 
     /// Folders worth offering on first run: ones that exist and are not yet in the library.
@@ -365,6 +407,47 @@ final class AppModel {
             var isDirectory: ObjCBool = false
             return !known.contains(path) && FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
                 && isDirectory.boolValue
+        }
+    }
+
+    // MARK: rekordbox
+
+    /// Writes crates as a rekordbox XML library, asking where to put it.
+    func exportForRekordbox(_ crates: [Crate]) {
+        guard !crates.isEmpty else {
+            alert = "There are no crates to export yet."
+            return
+        }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.xml]
+        panel.nameFieldStringValue = (crates.count == 1 ? crates[0].name.replacingOccurrences(of: "/", with: "-") : "Crate") + " for rekordbox.xml"
+        panel.prompt = "Export"
+        panel.message = "A library file rekordbox can read. The music stays where it is: the file points at it."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        alert = exportForRekordbox(crates, to: url)
+    }
+
+    /// Writes the file and says what went into it and how to get it into rekordbox.
+    @discardableResult
+    func exportForRekordbox(_ crates: [Crate], to url: URL) -> String {
+        do {
+            let export = try store.rekordboxExport(crates: crates)
+            try export.xml.write(to: url, atomically: true, encoding: .utf8)
+            let what = crates.count == 1 ? "“\(crates[0].name)”" : "\(export.playlists) crates"
+            var lines = ["Exported \(what): \(export.tracks == 1 ? "1 track" : "\(export.tracks) tracks") with tempo, key, beat grid, hot cues and loops."]
+            if !export.leftOut.isEmpty {
+                let count = export.leftOut.count
+                lines.append(
+                    "\(count == 1 ? "1 track was" : "\(count) tracks were") left out: rekordbox needs a file on this Mac, "
+                        + "which streaming tracks and tracks kept on another Mac do not have.")
+            }
+            lines.append(
+                "In rekordbox: Preferences > Advanced > Database > rekordbox xml, and choose this file. "
+                    + "Then open “rekordbox xml” in the tree on the left and drag the playlist into Playlists. "
+                    + "If “rekordbox xml” is not in the tree, turn it on under Preferences > View > Layout.")
+            return lines.joined(separator: "\n\n")
+        } catch {
+            return "The export could not be written: \(error.localizedDescription)"
         }
     }
 
@@ -419,7 +502,10 @@ final class AppModel {
 
     /// Works through tracks that have no BPM, key or waveform yet, one at a time, in the background.
     func analyzePending() {
-        guard analysisTask == nil else { return }
+        guard analysisTask == nil else {
+            analysisWanted = true
+            return
+        }
         let store = self.store
         analysisTask = Task {
             let pending = ((try? store.unanalyzedLocalTracks()) ?? [])
@@ -432,6 +518,10 @@ final class AppModel {
             }
             if !pending.isEmpty { self.activity = nil }
             self.analysisTask = nil
+            if self.analysisWanted {
+                self.analysisWanted = false
+                self.analyzePending()
+            }
         }
     }
 

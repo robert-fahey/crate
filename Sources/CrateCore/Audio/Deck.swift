@@ -61,6 +61,13 @@ public struct DeckState: Equatable, Sendable {
     public var isScratching = false
     /// The active loop, in seconds.
     public var loop: ClosedRange<Double>?
+    /// How many times the deck has been round the loop since it was set, or since the deck last
+    /// jumped; negative when it went round backwards. `position` drops back by the loop's length
+    /// each time, and this is what tells that apart from a jump.
+    public var loopPass = 0
+    /// Seconds of the track the record has turned through since it went on, backwards counted
+    /// against. Unlike `position` it does not jump: not at a cue, a seek or a loop's end.
+    public var travel = 0.0
     /// Loudest output sample in the last render, linear.
     public var peak: Float = 0
     /// How much of the track is decoded, 0...1.
@@ -147,6 +154,11 @@ public final class Deck: @unchecked Sendable {
 
     // MARK: State
 
+    /// The loudest sample the deck has made before its fader (after trim, EQ, filter and echo) since
+    /// this was last read; 1 is full scale. For the channel's level meter, and for it alone: reading
+    /// starts the next measurement.
+    public func takeLevel() -> Float { crate_deck_take_level(core) }
+
     public func state() -> DeckState {
         var snapshot = CrateDeckSnapshot()
         crate_deck_snapshot(core, &snapshot)
@@ -167,11 +179,13 @@ public final class Deck: @unchecked Sendable {
             // What is heard now left the deck `lead` frames ago.
             state.position = max(0, snapshot.position / audio.sampleRate - Double(lead) / sampleRate * snapshot.speed)
             state.speed = snapshot.speed
+            state.travel = snapshot.travel / audio.sampleRate
             state.isPlaying = snapshot.playing && !snapshot.ended
             state.isEnded = snapshot.ended
             state.isScratching = snapshot.scratching
             if snapshot.looping {
                 state.loop = (snapshot.loopStart / audio.sampleRate)...(snapshot.loopEnd / audio.sampleRate)
+                state.loopPass = Int(snapshot.loopWraps)
             }
             return state
         }

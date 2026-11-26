@@ -189,14 +189,45 @@ private struct ServiceSettings: View {
             } footer: {
                 Text("Create an app at developer.tidal.com and paste its client ID and secret. Crate searches TIDAL and opens tracks in the TIDAL app, which it cannot pause or seek.")
             }
+            Section {
+                LabeledContent("tiddl") {
+                    Text(model.grab.status).foregroundStyle(.secondary).multilineTextAlignment(.trailing).textSelection(.enabled)
+                }
+                LabeledContent("Save to") {
+                    HStack {
+                        Text((model.grab.folder as NSString).abbreviatingWithTildeInPath).lineLimit(1).truncationMode(.middle)
+                            .foregroundStyle(.secondary)
+                        Button("Choose…") { chooseGrabFolder() }
+                    }
+                }
+                Picker("Quality", selection: Binding(get: { model.grab.quality }, set: { model.grab.quality = $0 })) {
+                    ForEach(Tiddl.Quality.allCases, id: \.self) { Text($0.displayName).tag($0) }
+                }
+            } header: {
+                Text("Grabbing from TIDAL")
+            } footer: {
+                Text("File > Grab from TIDAL downloads tracks as files with tiddl, a separate tool that signs in with your own TIDAL account, and adds them to the library. Crate uses the tiddl you have installed. The folder becomes a library folder.")
+            }
         }
         .formStyle(.grouped)
         .onAppear {
+            model.grab.check()
             spotifyClientID = model.spotify.clientID ?? ""
             spotifyConnected = model.spotify.isConnected
             tidalClientID = model.tidal.clientID ?? ""
         }
         .onChange(of: model.spotifyStatus) { spotifyConnected = model.spotify.isConnected }
+    }
+
+    private func chooseGrabFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = URL(fileURLWithPath: model.grab.folder)
+        panel.prompt = "Save Here"
+        panel.message = "Tracks grabbed from TIDAL go here, in folders by artist and album."
+        if panel.runModal() == .OK, let url = panel.url { model.grab.folder = url.path }
     }
 }
 

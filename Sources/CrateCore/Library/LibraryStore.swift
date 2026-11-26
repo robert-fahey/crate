@@ -216,6 +216,38 @@ public final class LibraryStore {
                 try db.execute("PRAGMA user_version = 8")
             }
         }
+        if version < 9 {
+            // The mix history: each track played, when, and what it was mixed in from.
+            try db.transaction {
+                try db.execute("""
+                    CREATE TABLE plays (
+                        id INTEGER PRIMARY KEY,
+                        session INTEGER NOT NULL,
+                        track_id INTEGER NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
+                        played_at REAL NOT NULL,
+                        deck TEXT NOT NULL DEFAULT '',
+                        from_track INTEGER REFERENCES tracks(id) ON DELETE SET NULL
+                    )
+                    """)
+                try db.execute("CREATE INDEX plays_session ON plays(session, played_at)")
+                try db.execute("PRAGMA user_version = 9")
+            }
+        }
+        if version < 10 {
+            // Sample banks: named sets of eight sampler pads, one up on each deck, and the tracks a bank comes up with.
+            try db.transaction {
+                try db.execute("CREATE TABLE sample_banks (id INTEGER PRIMARY KEY, name TEXT NOT NULL, pads TEXT NOT NULL DEFAULT '[]')")
+                try db.execute("""
+                    CREATE TABLE track_sample_banks (
+                        track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+                        bank_id INTEGER NOT NULL REFERENCES sample_banks(id) ON DELETE CASCADE
+                    )
+                    """)
+                // The eight pads there were until now become the first bank, which is what deck A starts with.
+                try db.execute("INSERT INTO sample_banks (name, pads) SELECT 'Bank 1', value FROM settings WHERE key = 'sampler.pads'")
+                try db.execute("PRAGMA user_version = 10")
+            }
+        }
     }
 
     func changed() {
@@ -881,6 +913,42 @@ public final class LibraryStore {
         }
         changed()
         return removed
+    }
+
+    /// Puts one track where another is in every crate, as when a streaming track's file has been
+    /// downloaded: the file takes its place and keeps its position. The track that was there stays
+    /// in the library. Returns how many crates changed.
+    @discardableResult
+    public func replaceInCrates(track old: Int64, with new: Int64) throws -> Int {
+        guard old != new, try track(id: new) != nil else { return 0 }
+        let count: Int = try db.transaction {
+            // What was played as the one is, from here on, the other having been played.
+            try db.execute("UPDATE plays SET track_id = ? WHERE track_id = ?", [.int(new), .int(old)])
+            try db.execute("UPDATE plays SET from_track = ? WHERE from_track = ?", [.int(new), .int(old)])
+            // The sample bank that came up with the one comes up with the other, unless it has its own.
+            try db.execute(
+                "INSERT OR IGNORE INTO track_sample_banks (track_id, bank_id) SELECT ?, bank_id FROM track_sample_banks WHERE track_id = ?",
+                [.int(new), .int(old)])
+            try db.execute("DELETE FROM track_sample_banks WHERE track_id = ?", [.int(old)])
+            var count = 0
+            for row in try db.query("SELECT crate_id FROM crate_tracks WHERE track_id = ?", [.int(old)]) {
+                guard let crate = row.int("crate_id") else { continue }
+                let there = try db.query(
+                    "SELECT 1 AS found FROM crate_tracks WHERE crate_id = ? AND track_id = ?", [.int(crate), .int(new)]).first != nil
+                if there {
+                    // The crate has both: the one being replaced goes.
+                    try db.execute("DELETE FROM crate_tracks WHERE crate_id = ? AND track_id = ?", [.int(crate), .int(old)])
+                } else {
+                    try db.execute(
+                        "UPDATE crate_tracks SET track_id = ? WHERE crate_id = ? AND track_id = ?", [.int(new), .int(crate), .int(old)])
+                }
+                try touchCrate(id: crate)
+                count += 1
+            }
+            return count
+        }
+        if count > 0 { changed() }
+        return count
     }
 
     /// Puts the given tracks first, in the given order; tracks not mentioned keep their order after them.

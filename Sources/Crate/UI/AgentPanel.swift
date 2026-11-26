@@ -432,7 +432,10 @@ struct CommandConfirmSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label("The agent wants to run a command", systemImage: "terminal").font(.headline)
+            Label(
+                request.isDownload ? "The agent wants to download from TIDAL" : "The agent wants to run a command",
+                systemImage: request.isDownload ? "arrow.down.circle" : "terminal"
+            ).font(.headline)
             Text(request.reason)
             ScrollView {
                 Text(request.command)
@@ -443,12 +446,14 @@ struct CommandConfirmSheet: View {
             }
             .frame(maxHeight: 160)
             .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 6))
-            Text("Runs in \((request.workingDirectory as NSString).abbreviatingWithTildeInPath) with your user account's access. It can change or delete files.")
-                .font(.caption).foregroundStyle(.secondary)
+            Text(request.isDownload
+                ? "tiddl saves the files in \((request.workingDirectory as NSString).abbreviatingWithTildeInPath), signed in with your TIDAL account, and Crate adds them to the library."
+                : "Runs in \((request.workingDirectory as NSString).abbreviatingWithTildeInPath) with your user account's access. It can change or delete files.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Spacer()
-                Button("Don't Run", role: .cancel) { decide(false) }.keyboardShortcut(.cancelAction)
-                Button("Run Command") { decide(true) }
+                Button(request.isDownload ? "Don't Download" : "Don't Run", role: .cancel) { decide(false) }.keyboardShortcut(.cancelAction)
+                Button(request.isDownload ? "Download" : "Run Command") { decide(true) }
             }
         }
         .padding(20)

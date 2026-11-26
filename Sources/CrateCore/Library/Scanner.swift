@@ -80,47 +80,15 @@ public final class LibraryScanner {
         for url in Self.audioFiles(in: folder) {
             try Task.checkCancellation()
             summary.found += 1
-            let path = url.path
-            let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
-            let size = Int64(values?.fileSize ?? 0)
-            let modified = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
-
-            guard size >= Self.minimumBytes else {
-                summary.tooShort += 1
-                continue
-            }
-            let location = Volumes.location(forPath: path)
-            let uri = ScannedFile.uri(path: path, volumeUUID: location?.uuid, relativePath: location?.relativePath)
-            let known = try store.fileStamp(uri: uri)
-            if let known, known.size == size, abs(known.modified - modified) < 1 {
-                summary.unchanged += 1
-                continue
-            }
-            guard let duration = TagReader.duration(path: path) else {
-                summary.unreadable += 1
-                continue
-            }
-            guard duration >= options.minimumDuration else {
-                summary.tooShort += 1
-                continue
+            switch try await take(url, root: folder, minimumDuration: options.minimumDuration) {
+            case .unchanged: summary.unchanged += 1
+            case .tooShort: summary.tooShort += 1
+            case .unreadable: summary.unreadable += 1
+            case .added: summary.added += 1
+            case .updated: summary.updated += 1
             }
 
-            let tags = await TagReader.read(path: path)
-            let guess = FilenameParser.guess(path: path, root: folder)
-            let content = Fingerprint.of(path: path)
-            try store.upsertLocal(
-                ScannedFile(
-                    path: path, volumeUUID: location?.uuid, relativePath: location?.relativePath,
-                    title: tags.title ?? guess.title,
-                    // A tag wins; the filename fills in whatever the tags lack.
-                    artist: tags.artist ?? guess.artist,
-                    album: tags.album ?? guess.album,
-                    duration: duration, bpm: tags.bpm, key: tags.key,
-                    format: url.pathExtension.lowercased(), size: size, modified: modified, contentID: content),
-                notify: false)
-            if known == nil { summary.added += 1 } else { summary.updated += 1 }
-
-            if (summary.added + summary.updated) % 20 == 0 {
+            if (summary.added + summary.updated) % 20 == 0, summary.added + summary.updated > 0 {
                 NotificationCenter.default.post(name: .libraryDidChange, object: store)
                 progress?(summary)
             }
@@ -128,6 +96,60 @@ public final class LibraryScanner {
         NotificationCenter.default.post(name: .libraryDidChange, object: store)
         progress?(summary)
         return summary
+    }
+
+    private enum Taken {
+        case unchanged, tooShort, unreadable, added, updated
+    }
+
+    /// Records one file, unless it is already recorded as it stands.
+    private func take(_ url: URL, root: String, minimumDuration: Double) async throws -> Taken {
+        let path = url.path
+        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+        let size = Int64(values?.fileSize ?? 0)
+        let modified = values?.contentModificationDate?.timeIntervalSince1970 ?? 0
+
+        guard minimumDuration <= 0 || size >= Self.minimumBytes else { return .tooShort }
+        let location = Volumes.location(forPath: path)
+        let uri = ScannedFile.uri(path: path, volumeUUID: location?.uuid, relativePath: location?.relativePath)
+        let known = try store.fileStamp(uri: uri)
+        if let known, known.size == size, abs(known.modified - modified) < 1 { return .unchanged }
+        guard let duration = TagReader.duration(path: path) else { return .unreadable }
+        guard duration >= minimumDuration else { return .tooShort }
+
+        let tags = await TagReader.read(path: path)
+        let guess = FilenameParser.guess(path: path, root: root)
+        let content = Fingerprint.of(path: path)
+        try store.upsertLocal(
+            ScannedFile(
+                path: path, volumeUUID: location?.uuid, relativePath: location?.relativePath,
+                title: tags.title ?? guess.title,
+                // A tag wins; the filename fills in whatever the tags lack.
+                artist: tags.artist ?? guess.artist,
+                album: tags.album ?? guess.album,
+                duration: duration, bpm: tags.bpm, key: tags.key,
+                format: url.pathExtension.lowercased(), size: size, modified: modified, contentID: content),
+            notify: false)
+        return known == nil ? .added : .updated
+    }
+
+    /// Adds one file the user asked for by name, whatever its length, and returns its track.
+    /// The folder it is in becomes a library folder unless a library folder already holds it, so
+    /// that the file is looked after like the rest.
+    /// - Parameter root: the folder to add, which the file is somewhere under.
+    @discardableResult
+    public func add(file: String, root: String) async throws -> Track? {
+        let root = URL(fileURLWithPath: (root as NSString).expandingTildeInPath).standardizedFileURL.path
+        let path = URL(fileURLWithPath: file).standardizedFileURL.path
+        let folders = try store.folders().map { $0.path.hasSuffix("/") ? $0.path : $0.path + "/" }
+        if !folders.contains(where: { path.hasPrefix($0) }) {
+            let location = Volumes.location(forPath: root)
+            try store.addFolder(path: root, volumeUUID: location?.uuid, relativePath: location?.relativePath)
+        }
+        _ = try await take(URL(fileURLWithPath: path), root: root, minimumDuration: 0)
+        NotificationCenter.default.post(name: .libraryDidChange, object: store)
+        let location = Volumes.location(forPath: path)
+        return try store.track(uri: ScannedFile.uri(path: path, volumeUUID: location?.uuid, relativePath: location?.relativePath))
     }
 
     /// Rescans every library folder that is currently reachable.

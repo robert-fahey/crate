@@ -299,7 +299,7 @@ struct CueEditor: View {
     private func doubleClick(at point: CGPoint) {
         let x = point.x
         if let cue = cue(at: point) {
-            // A flag double-clicked: go there, as its pad would.
+            // A flag double-clicked: play from there, as its pad would.
             selected = cue.slot
             deck.hotCue(cue.slot)
             return
@@ -427,7 +427,7 @@ struct CueEditor: View {
                 }
             }
             .buttonStyle(PadButtonStyle(isOn: cue != nil, color: color, minWidth: 28, height: 24))
-            .help(cue == nil ? "Set pad \(slot) at the playhead" : "Go to pad \(slot), as hitting it on the deck does")
+            .help(cue == nil ? "Set pad \(slot) at the playhead" : "Play from pad \(slot), as hitting it on the deck does")
             if let cue {
                 TextField("Name", text: Binding(
                     get: { deck.cuePoints[slot]?.name ?? "" },

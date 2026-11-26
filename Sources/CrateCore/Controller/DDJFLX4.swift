@@ -41,8 +41,8 @@ public enum ControlEvent: Equatable, Sendable {
     case hotCue(DeckID, Int)
     case clearHotCue(DeckID, Int)
     case beatLoop(DeckID, beats: Double)
-    /// A sampler pad, 0...7, hit; with SHIFT it stops the pad instead.
-    case sample(Int, stop: Bool)
+    /// A sampler pad, 0...7 of that side's bank, hit; with SHIFT it stops the pad instead.
+    case sample(DeckID, Int, stop: Bool)
 
     /// The browse knob: rows down the track list, negative for up.
     case browse(Int)
@@ -163,8 +163,8 @@ public enum DDJFLX4 {
                 case 0x20...0x27:
                     let size = Double(1 << (Int(number - 0x20) / 2))
                     return .jump(deck, beats: number % 2 == 0 ? -size : size)
-                // Both sides' pads play the same eight samples.
-                case 0x30...0x37: return .sample(Int(number - 0x30), stop: shifted)
+                // Each side's pads play the bank of the deck on that side.
+                case 0x30...0x37: return .sample(deck, Int(number - 0x30), stop: shifted)
                 default: return nil
                 }
             default:

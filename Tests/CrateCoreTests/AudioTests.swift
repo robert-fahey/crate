@@ -225,6 +225,94 @@ final class DeckEngineTests: XCTestCase {
         XCTAssertTrue(deck.state().isEnded, "with the loop off it plays out")
     }
 
+    func testTripsRoundALoopAreCountedAndAJumpStartsTheCountAgain() throws {
+        let engine = try engine()
+        let deck = engine.deck(.a)
+        deck.load(TrackAudio(left: [Float](repeating: 0.1, count: Int(Probe.rate * 8)), sampleRate: Probe.rate))
+        deck.seek(to: 0.75)
+        deck.loop(from: 1.0, to: 1.5)
+        deck.play()
+        _ = try engine.render(seconds: 0.5)
+        XCTAssertEqual(deck.state().loopPass, 0, "in the loop for the first time")
+        XCTAssertEqual(deck.state().position, 1.25, accuracy: 0.01)
+        _ = try engine.render(seconds: 1.5)
+        // 2 seconds played from 0.75: a quarter second to reach the loop, then three and a half times round it.
+        XCTAssertEqual(deck.state().loopPass, 3)
+        XCTAssertEqual(deck.state().position, 1.25, accuracy: 0.01)
+        // The position has dropped back three times, but the record has only ever turned forwards.
+        XCTAssertEqual(deck.state().travel, 2.0, accuracy: 0.01)
+        XCTAssertEqual(deck.state().position + Double(deck.state().loopPass) * 0.5, 0.75 + deck.state().travel, accuracy: 0.001)
+
+        deck.seek(to: 1.1)
+        _ = try engine.render(seconds: 0.1)
+        XCTAssertEqual(deck.state().loopPass, 0, "a jump is not a trip round the loop")
+        XCTAssertEqual(deck.state().travel, 2.1, accuracy: 0.01, "nor a turn of the record")
+
+        // Halving a loop from beyond its new end drops the deck back into it, which counts as once round.
+        _ = try engine.render(seconds: 0.25)
+        deck.loop(from: 1.0, to: 1.25)
+        _ = try engine.render(seconds: 0.03)
+        XCTAssertEqual(deck.state().loopPass, 1)
+        XCTAssertEqual(deck.state().position, 1.23, accuracy: 0.01)
+
+        deck.endLoop()
+        _ = try engine.render(seconds: 0.5)
+        XCTAssertEqual(deck.state().loopPass, 0)
+        XCTAssertEqual(deck.state().position, 1.73, accuracy: 0.01)
+    }
+
+    func testALoopIsLaidOutPassAfterPassAlongTheWave() {
+        typealias Segment = WaveUnroll.Segment
+        // No loop: the track as it stands.
+        XCTAssertEqual(WaveUnroll.segments(around: 30, reach: 5, loop: nil, pass: 0), [Segment(from: 25, to: 35)])
+
+        // First time through a two-second loop, half a second in: the track before it, then pass after pass.
+        let loop = 10.0...12.0
+        XCTAssertEqual(
+            WaveUnroll.segments(around: 10.5, reach: 5, loop: loop, pass: 0),
+            [
+                Segment(from: 5.5, to: 10), Segment(from: 10, to: 12, shift: 0, isPass: true),
+                Segment(from: 10, to: 12, shift: 2, isPass: true), Segment(from: 10, to: 11.5, shift: 4, isPass: true),
+            ])
+        // Once round: behind the playhead is the pass just played, and the lead-in before that.
+        XCTAssertEqual(
+            Array(WaveUnroll.segments(around: 10.5, reach: 5, loop: loop, pass: 1).prefix(3)),
+            [
+                Segment(from: 7.5, to: 10, shift: -2), Segment(from: 10, to: 12, shift: -2, isPass: true),
+                Segment(from: 10, to: 12, shift: 0, isPass: true),
+            ])
+
+        // The wave does not move when the deck drops back: just before the end of one pass and just
+        // after the start of the next, every stretch of the track is drawn where it was.
+        func places(_ position: Double, pass: Int) -> [[Double]] {
+            WaveUnroll.segments(around: position, reach: 5, loop: loop, pass: pass).map {
+                [$0.from + $0.shift - position, $0.to + $0.shift - position, $0.from]
+            }
+        }
+        let before = places(11.999, pass: 4), after = places(10.001, pass: 5)
+        XCTAssertEqual(before.count, after.count)
+        for (old, new) in zip(before.dropFirst().dropLast(), after.dropFirst().dropLast()) {
+            XCTAssertEqual(old[0], new[0] + 0.002, accuracy: 1e-9)
+            XCTAssertEqual(old[1], new[1] + 0.002, accuracy: 1e-9)
+            XCTAssertEqual(old[2], new[2], accuracy: 1e-9)
+        }
+
+        // A deck that reaches the loop from before it sees the track as it stands, then the loop repeating.
+        XCTAssertEqual(
+            WaveUnroll.segments(around: 3, reach: 5, loop: loop, pass: 0), [Segment(from: -2, to: 8)])
+        XCTAssertEqual(WaveUnroll.segments(around: 9, reach: 2, loop: loop, pass: 0).map(\.isPass), [false, true])
+
+        // What a click on the wave lands on.
+        XCTAssertEqual(WaveUnroll.time(at: 13.5, reach: 5, loop: loop, pass: 0), 11.5, accuracy: 1e-9, "the next pass")
+        XCTAssertEqual(WaveUnroll.time(at: 9.5, reach: 5, loop: loop, pass: 0), 9.5, accuracy: 1e-9, "the track before the loop")
+        XCTAssertEqual(WaveUnroll.time(at: 9.5, reach: 5, loop: loop, pass: 1), 11.5, accuracy: 1e-9, "the pass before")
+        XCTAssertEqual(WaveUnroll.time(at: 7.5, reach: 5, loop: loop, pass: 1), 9.5, accuracy: 1e-9, "the lead-in, one pass back")
+        XCTAssertEqual(WaveUnroll.time(at: 13.5, reach: 5, loop: nil, pass: 0), 13.5)
+
+        // A loop too short to see its passes is left as the track stands.
+        XCTAssertEqual(WaveUnroll.segments(around: 10, reach: 5, loop: 10.0...10.002, pass: 9), [Segment(from: 5, to: 15)])
+    }
+
     func testEQKillsRemoveTheirBandAndLeaveTheOthers() throws {
         func level(of hertz: Double, kill: DeckParam?) throws -> Float {
             let engine = try engine()
@@ -563,10 +651,12 @@ final class RecordingTests: XCTestCase {
         try engine.startRecording(to: url)
         let played = try engine.render(seconds: 2)
         XCTAssertTrue(engine.isRecording)
-        // The output is handed over in tenth-of-a-second pieces, so the very end can be missing.
+        // The output is handed over on another thread, a moment after it is rendered: on a busy
+        // machine stopping at once could catch it with nothing written yet.
+        Thread.sleep(forTimeInterval: 0.2)
+        // It comes in tenth-of-a-second pieces, so the very end can be missing.
         XCTAssertEqual(engine.stopRecording(), 2, accuracy: 0.25)
         XCTAssertEqual(engine.takeMasterPeak(), 0.4, accuracy: 0.06)
-        XCTAssertEqual(engine.takeMasterPeak(), 0, "reading the peak resets it")
 
         let file = try AVAudioFile(forReading: url)
         XCTAssertEqual(Double(file.length) / file.fileFormat.sampleRate, 2, accuracy: 0.25)
@@ -877,10 +967,10 @@ final class ControllerTests: XCTestCase {
         XCTAssertEqual(
             events([[0x97, 0x00, 0x7F], [0x99, 0x07, 0x7F], [0x98, 0x02, 0x7F], [0x97, 0x62, 0x7F], [0x99, 0x20, 0x7F], [0x99, 0x25, 0x7F]]),
             [.hotCue(.a, 1), .hotCue(.b, 8), .clearHotCue(.a, 3), .beatLoop(.a, beats: 1), .jump(.b, beats: -1), .jump(.b, beats: 4)])
-        // SAMPLER mode: either side's pads play the same eight samples, and with SHIFT a pad stops.
+        // SAMPLER mode: each side's pads play that deck's bank of eight, and with SHIFT a pad stops.
         XCTAssertEqual(
-            events([[0x90, 0x22, 0x7F], [0x97, 0x30, 0x7F], [0x99, 0x37, 0x7F], [0x9A, 0x31, 0x7F]]),
-            [.padMode(.a, .sampler), .sample(0, stop: false), .sample(7, stop: false), .sample(1, stop: true)])
+            events([[0x90, 0x22, 0x7F], [0x97, 0x30, 0x7F], [0x99, 0x37, 0x7F], [0x9A, 0x31, 0x7F], [0x98, 0x35, 0x7F]]),
+            [.padMode(.a, .sampler), .sample(.a, 0, stop: false), .sample(.b, 7, stop: false), .sample(.b, 1, stop: true), .sample(.a, 5, stop: true)])
         XCTAssertFalse(DDJFLX4.message(for: .sample(.b, 2), on: true).isEmpty)
         XCTAssertEqual(
             events([[0x90, 0x10, 0x7F], [0x90, 0x10, 0x00], [0x90, 0x11, 0x7F], [0x91, 0x4D, 0x7F], [0x91, 0x51, 0x7F], [0x91, 0x53, 0x7F]]),

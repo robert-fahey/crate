@@ -108,6 +108,9 @@ struct PadButtonStyle: ButtonStyle {
     var color: Color = .white
     var minWidth: CGFloat = 30
     var height: CGFloat = 26
+    /// Takes its share of the row it is in rather than the width of its label, so a label that
+    /// changes (a recording's running time) moves nothing; the label shrinks to fit if it must.
+    var fills = false
 
     func makeBody(configuration: Configuration) -> some View { Pad(style: self, configuration: configuration) }
 
@@ -120,9 +123,10 @@ struct PadButtonStyle: ButtonStyle {
             configuration.label
                 .font(.system(size: 11 * scale, weight: .bold, design: .rounded))
                 .lineLimit(1)
-                .fixedSize()
-                .padding(.horizontal, 7 * scale)
-                .frame(minWidth: style.minWidth * scale, minHeight: style.height * scale)
+                .minimumScaleFactor(style.fills ? 0.7 : 1)
+                .fixedSize(horizontal: !style.fills, vertical: true)
+                .padding(.horizontal, (style.fills ? 4 : 7) * scale)
+                .frame(minWidth: style.minWidth * scale, maxWidth: style.fills ? .infinity : nil, minHeight: style.height * scale)
                 .foregroundStyle(style.isOn ? Color.black.opacity(0.85) : Color.white.opacity(0.86))
                 .background(PadFace(isOn: style.isOn, isPressed: configuration.isPressed, color: style.color, radius: 7 * scale))
                 .contentShape(Rectangle())
@@ -220,8 +224,12 @@ struct Knob: View {
     let label: String
     var color: Color = .white
     var size: CGFloat = 34
+    /// A width for the knob and its label together, where two knobs should stand the same.
+    var width: CGFloat?
     @State private var dragStart: Double?
     @Environment(\.deckScale) private var scale
+    /// Room round the drawing for the lit arc's glow, which would otherwise be cut off square.
+    private static let bleed: CGFloat = 8
 
     private var fraction: Double { (value - range.lowerBound) / (range.upperBound - range.lowerBound) }
 
@@ -268,10 +276,12 @@ struct Knob: View {
         VStack(spacing: 2) {
             Canvas { context, canvas in
                 var scaled = context
+                scaled.translateBy(x: Self.bleed, y: Self.bleed)
                 scaled.scaleBy(x: scale, y: scale)
-                draw(&scaled, CGSize(width: canvas.width / scale, height: canvas.height / scale))
+                draw(&scaled, CGSize(width: (canvas.width - 2 * Self.bleed) / scale, height: (canvas.height - 2 * Self.bleed) / scale))
             }
-                .frame(width: size * scale, height: size * scale)
+                .frame(width: size * scale + 2 * Self.bleed, height: size * scale + 2 * Self.bleed)
+                .padding(-Self.bleed)
                 .contentShape(Circle())
                 .gesture(
                     DragGesture(minimumDistance: 1)
@@ -288,7 +298,10 @@ struct Knob: View {
                 .font(.system(size: 8.5 * scale, weight: .bold, design: .rounded))
                 .tracking(0.6)
                 .foregroundStyle(.white.opacity(0.55))
+                .lineLimit(1)
+                .fixedSize()
         }
+        .frame(width: width.map { $0 * scale })
         .accessibilityElement()
         .accessibilityLabel(label)
         .accessibilityValue(String(format: "%.2f", value))
@@ -331,6 +344,12 @@ struct VerticalFader: View {
             let height = geometry.size.height, cap: CGFloat = 18 * scale
             let travel = max(1, height - cap)
             ZStack(alignment: .top) {
+                // Marks every quarter of the way, longer at the ends and the middle.
+                ForEach(0..<5, id: \.self) { mark in
+                    Rectangle().fill(.white.opacity(mark % 2 == 0 ? 0.24 : 0.13))
+                        .frame(width: (mark % 2 == 0 ? 17 : 12) * scale, height: 1)
+                        .offset(y: cap / 2 + travel * CGFloat(mark) / 4 - 0.5)
+                }
                 Capsule().fill(DeckStyle.well).frame(width: 6 * scale)
                     .overlay(Capsule().strokeBorder(.white.opacity(0.10), lineWidth: 0.8).frame(width: 6 * scale))
                     .frame(maxHeight: .infinity)
@@ -417,30 +436,69 @@ struct HorizontalFader: View {
     }
 }
 
-/// A level meter: green, then amber, then red at full scale, each lit segment glowing a little.
+/// How the lights of a level meter are drawn.
+enum MeterDrawing {
+    static let gap: CGFloat = 1.5
+
+    static func color(of light: Int) -> Color {
+        if light >= MeterScale.firstRed { return Color(red: 1, green: 0.25, blue: 0.3) }
+        if light >= MeterScale.firstAmber { return Color(red: 1, green: 0.82, blue: 0.25) }
+        return Color(hue: 0.40 - Double(light) / Double(MeterScale.firstAmber) * 0.07, saturation: 0.75, brightness: 0.95)
+    }
+
+    /// The middle of a light, from the top of a meter `height` tall. A fraction is a place between two lights.
+    static func middle(of light: Double, height: CGFloat) -> CGFloat {
+        let pitch = (height + gap) / CGFloat(MeterScale.count)
+        return height - (CGFloat(light) + 0.5) * pitch + gap / 2
+    }
+
+    /// One column of lights: on up to the level, and one more left on at the loudest recent peak.
+    static func column(_ context: inout GraphicsContext, in rect: CGRect, lights: MeterLights) {
+        let pitch = (rect.height + gap) / CGFloat(MeterScale.count)
+        for light in 0..<MeterScale.count {
+            let isOn = light < lights.lit || light + 1 == lights.held
+            let place = CGRect(x: rect.minX, y: rect.maxY - CGFloat(light + 1) * pitch + gap, width: rect.width, height: pitch - gap)
+            context.fill(Path(roundedRect: place, cornerRadius: 1), with: .color(color(of: light).opacity(isOn ? 1 : 0.13)))
+        }
+    }
+}
+
+/// A level meter: green, then amber up to full scale, then red over it. The level falls back
+/// steadily between peaks, and the loudest recent peak stays lit for a moment.
 struct LevelMeter: View {
-    let level: Float
+    let lights: MeterLights
     @Environment(\.deckScale) private var scale
 
     var body: some View {
         Canvas { context, size in
-            let segments = 20
-            let gap: CGFloat = 1.5
-            let height = (size.height - gap * CGFloat(segments - 1)) / CGFloat(segments)
-            // Decibels read better than raw level: -42 dB at the bottom, 0 at the top.
-            let decibels = level > 0 ? 20 * log10(level) : -100
-            let lit = Int((CGFloat(max(0, min(1, (decibels + 42) / 42))) * CGFloat(segments)).rounded())
-            for segment in 0..<segments {
-                let y = size.height - CGFloat(segment + 1) * height - CGFloat(segment) * gap
-                let place = Double(segment) / Double(segments - 1)
-                let color = place > 0.93 ? Color(red: 1, green: 0.25, blue: 0.3)
-                    : (place > 0.75 ? Color(red: 1, green: 0.82, blue: 0.25) : Color(hue: 0.40 - place * 0.08, saturation: 0.75, brightness: 0.95))
-                let rect = CGRect(x: 0, y: y, width: size.width, height: height)
-                context.fill(Path(roundedRect: rect, cornerRadius: 1), with: .color(color.opacity(segment < lit ? 1 : 0.13)))
-            }
+            MeterDrawing.column(&context, in: CGRect(origin: .zero, size: size), lights: lights)
         }
-        .frame(width: 5 * scale)
-        .shadow(color: level > 0.02 ? Color.green.opacity(0.35) : .clear, radius: 3)
+        .frame(width: 6 * scale)
+        .shadow(color: lights.lit > 0 ? Color.green.opacity(0.35) : .clear, radius: 3)
+        .accessibilityHidden(true)
+    }
+}
+
+/// The master meter: left and right, with the decibel marks between them.
+struct StereoMeter: View {
+    let left: MeterLights
+    let right: MeterLights
+    @Environment(\.deckScale) private var scale
+
+    var body: some View {
+        HStack(spacing: 0) {
+            LevelMeter(lights: left)
+            Canvas { context, size in
+                for mark in MeterScale.marks {
+                    let text = Text(mark.label)
+                        .font(.system(size: 6.5 * scale, weight: .bold, design: .rounded))
+                        .foregroundStyle(Color.white.opacity(mark.label == "0" ? 0.8 : 0.42))
+                    context.draw(text, at: CGPoint(x: size.width / 2, y: MeterDrawing.middle(of: mark.light, height: size.height)))
+                }
+            }
+            .frame(width: 17 * scale)
+            LevelMeter(lights: right)
+        }
         .accessibilityHidden(true)
     }
 }
@@ -453,7 +511,7 @@ struct Platter: View {
     var body: some View {
         let colors = DeckStyle.colors(deck.id.rawValue)
         // Read so that a scrub while stopped still turns the record.
-        let polled = deck.position
+        let _ = deck.position
         let isLoaded = deck.isLoaded
         let isPlaying = deck.isPlaying
         let audio = deck.deck
@@ -461,7 +519,9 @@ struct Platter: View {
             // In a host of its own, so that turning does not make the decks lay themselves out again.
             IsolatedHost {
                 TimelineView(.animation(minimumInterval: 1.0 / 30, paused: !isPlaying)) { _ in
-                    let seconds = isPlaying ? audio.state().position : polled
+                    // How far the record has turned, not where in the track it is: a loop going
+                    // round or a jump to a cue does not flick the label to another angle.
+                    let seconds = audio.state().travel
                     Canvas(rendersAsynchronously: true) { context, size in
                         Self.draw(&context, size: size, colors: colors, turns: seconds * 33.333 / 60, isLoaded: isLoaded)
                     }

@@ -11,14 +11,18 @@ public enum ProcessRunner {
     }
 
     public static func run(
-        executable: String, arguments: [String], workingDirectory: String? = nil, timeout: TimeInterval,
-        outputLimit: Int = 1_000_000
+        executable: String, arguments: [String], workingDirectory: String? = nil, environment: [String: String]? = nil,
+        timeout: TimeInterval, outputLimit: Int = 1_000_000
     ) async throws -> Result {
         try await withCheckedThrowingContinuation { continuation in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: executable)
             process.arguments = arguments
             if let workingDirectory { process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory) }
+            // Given values are added to what this process has, rather than standing in for it.
+            if let environment {
+                process.environment = ProcessInfo.processInfo.environment.merging(environment) { _, given in given }
+            }
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = pipe
@@ -119,6 +123,9 @@ public struct CommandRequest: Identifiable, Equatable, Sendable {
     public var workingDirectory: String
     /// The agent's stated reason, shown to the user next to the command.
     public var reason: String
+    /// True for a download with tiddl rather than a command of the agent's own writing: the same
+    /// question, put in words that fit.
+    public var isDownload = false
 }
 
 public enum CommandTool {

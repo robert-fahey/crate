@@ -165,6 +165,44 @@ enum DebugDriver {
             case "stop": deck.tapeStop()
             default: log("unknown deck action \(action[0])")
             }
+        case "grab":
+            // grab:folder=<path>  grab:find=<line>|<line>  grab:pick=<row>,<match or ->  grab:go  grab:tidal (the selected
+            // TIDAL tracks)  grab:wait  grab:list  grab:show  grab:hide
+            let parts = argument.split(separator: "=", maxSplits: 1).map(String.init)
+            let value = parts.count > 1 ? parts[1] : ""
+            let grab = model.grab
+            switch parts[0] {
+            case "folder": grab.folder = value
+            case "find":
+                grab.open(crate: model.currentCrate)
+                grab.text = value.replacingOccurrences(of: "|", with: "\n")
+                grab.find()
+            case "pick":
+                let numbers = value.split(separator: ",").map(String.init)
+                guard numbers.count == 2, let row = Int(numbers[0]), grab.rows.indices.contains(row) else { return log("no such row") }
+                grab.choose(Int(numbers[1]).flatMap { grab.rows[row].matches.indices.contains($0) ? grab.rows[row].matches[$0].id : nil }, for: grab.rows[row].id)
+            case "go": grab.grab()
+            case "tidal": grab.grab(streaming: model.selectedTracks)
+            case "missing": grab.open(finding: model.selectedTracks, crate: model.currentCrate)
+            case "show": grab.isShown = true
+            case "hide": grab.isShown = false
+            case "wait":
+                for _ in 0..<3000 where grab.isBusy { await sleep(0.1) }
+            default: break
+            }
+            log("grab: \(grab.stage)\(grab.isBusy ? ", busy" : "")\(grab.problem.map { ", problem: \($0)" } ?? "")\(grab.summary.map { ", \($0)" } ?? "")")
+            if parts[0] == "list" || parts[0] == "wait" {
+                for (index, row) in grab.rows.enumerated() {
+                    log("  \(index) [\(row.state)] asked “\(row.asked)” chosen: \(row.chosen.map(GrabRowText.line) ?? "none")")
+                    if parts[0] == "list" { for (number, hit) in row.matches.enumerated() { log("      \(number): \(GrabRowText.line(hit))") } }
+                }
+            }
+        case "rekordbox":
+            // rekordbox:<crate name|all>:<path> writes the export without asking where.
+            let parts = argument.split(separator: ":", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { return log("rekordbox:<crate|all>:<path>") }
+            let crates = parts[0] == "all" ? model.crates : model.crates.filter { $0.name == parts[0] }
+            log("rekordbox: " + model.exportForRekordbox(crates, to: URL(fileURLWithPath: parts[1])).replacingOccurrences(of: "\n\n", with: " | "))
         case "mixplan":
             // mixplan:<crate> opens the mix editor; mixplan:<crate>:suggest saves Crate's own transition for every pair
             // that has none; :list prints them; :play plays the crate as a mix; :preview:<n> tries the nth transition;
@@ -220,7 +258,9 @@ enum DebugDriver {
             }.joined(separator: " | "))
         case "sampler":
             // sampler:show, sampler:hide, sampler:load:<pad>:<row>, sampler:take:<pad>:<A|B>, sampler:hit:<pad>,
-            // sampler:loop:<pad>, sampler:stop, sampler:list. Pads count from 1.
+            // Pads count from 1: 1 to 8 are deck A's bank, 9 to 16 deck B's.
+            // sampler:loop:<pad>, sampler:sync:<pad>, sampler:beats:<pad>:<beats>, sampler:file:<pad>:<path>, sampler:quantize:<off|beats>,
+            // sampler:stop, sampler:list. Pads count from 1.
             let parts = argument.split(separator: ":").map(String.init)
             let sampler = model.mixer.sampler!
             let pad = (parts.count > 1 ? Int(parts[1]) ?? 1 : 1) - 1
@@ -233,11 +273,51 @@ enum DebugDriver {
             case "take": sampler.capture(from: model.mixer.deck(parts.last == "B" ? .b : .a), on: pad)
             case "hit": sampler.hit(pad)
             case "loop": sampler.setLoops(!sampler.pads[pad].loops, on: pad)
+            case "sync": sampler.setSync(!sampler.pads[pad].syncs, on: pad)
+            case "bank":
+                // sampler:bank:<A|B>:new, :use:<name>, :rename:<name>, :duplicate, :delete, :tie, :untie. Then the banks are listed.
+                let deck: DeckID = parts.count > 1 && parts[1] == "B" ? .b : .a
+                let name = parts.count > 3 ? parts[3...].joined(separator: ":") : ""
+                switch parts.count > 2 ? parts[2] : "" {
+                case "new": sampler.newBank(on: deck)
+                case "use": if let bank = sampler.banks.first(where: { $0.name == name }) { sampler.show(bank.id, on: deck) }
+                case "rename": sampler.renameBank(on: deck, to: name)
+                case "duplicate": sampler.duplicateBank(on: deck)
+                case "delete": sampler.deleteBank(on: deck)
+                case "tie": sampler.setBankTied(true, on: deck)
+                case "untie": sampler.setBankTied(false, on: deck)
+                default: break
+                }
+                for _ in 0..<100 where sampler.pads.contains(where: \.isLoading) { await sleep(0.1) }
+                log("sample banks: " + sampler.banks.map { bank in
+                    let on = DeckID.allCases.first { sampler.bankOn[$0.rawValue] == bank.id }
+                    let tied = on.map { sampler.bankIsTied[$0.rawValue] } ?? false
+                    return "\(bank.name)" + (on.map { " on \($0.name)" } ?? "") + (tied ? " tied to its track" : "") + " (\(bank.pads.compactMap { $0 }.count) pads)"
+                }.joined(separator: " | "))
+            case "quantize":
+                // sampler:quantize:off, or a grid in beats: 0.25, 0.5, 1 or 4 (a bar).
+                if parts.count > 1, let size = Double(parts[1]), SamplerSync.grids.contains(size) {
+                    sampler.quantum = size
+                    sampler.isQuantized = true
+                } else {
+                    sampler.isQuantized = false
+                }
+            case "beats": if parts.count > 2, let beats = Int(parts[2]) { sampler.setBeats(beats, on: pad) }
+            case "file":
+                if parts.count > 2 { sampler.load(path: parts[2...].joined(separator: ":"), on: pad) }
+                for _ in 0..<100 where sampler.pads.indices.contains(pad) && sampler.pads[pad].isLoading { await sleep(0.1) }
             case "stop": sampler.stop()
             default: break
             }
-            log("sampler: " + sampler.pads.filter(\.isLoaded).map {
-                String(format: "%d %@ %.2fs%@%@", $0.id + 1, $0.name, $0.seconds, $0.loops ? " loop" : "", $0.isPlaying ? String(format: " playing %.0f%%", $0.progress * 100) : "")
+            log("sampler: quantize " + (sampler.isQuantized ? SamplerModel.gridName(sampler.quantum) : "off") + " | " + sampler.pads.filter(\.isLoaded).map { pad in
+                var text = String(format: "%@%d %@ %.2fs%@", pad.deck.name, pad.slot + 1, pad.name, pad.seconds, pad.loops ? " loop" : "")
+                if pad.syncs, pad.loops {
+                    let state = sampler.syncState(of: pad.id)
+                    text += " sync" + (pad.bpm.map { String(format: " %.1f BPM", $0) } ?? "") + String(format: " x%.3f", state.rate)
+                    if let error = state.error { text += String(format: " off by %+.3f beats", error) }
+                }
+                if pad.isPlaying { text += String(format: " playing %.0f%%", pad.progress * 100) }
+                return text
             }.joined(separator: " | ") + (sampler.problem.map { " | problem: \($0)" } ?? ""))
         case "grid":
             // grid:A opens the grid editor on deck A; grid:close shuts it.
@@ -312,10 +392,25 @@ enum DebugDriver {
             model.selection = Set(rows.map { model.tracks[$0].id })
         case "history":
             log("history: \(model.agent.messages.count) messages; requests \(model.agent.pastRequests); last: \(model.agent.messages.last?.text.prefix(80) ?? "-")")
+        case "plays":
+            // plays prints the mix history; plays:show puts it in the window.
+            if argument == "show" { model.sidebar = .history }
+            log("mix history: \(model.history.playCount) plays in \(model.history.sessions.count) sessions")
+            for session in model.history.sessions.prefix(3) {
+                log("  session \(HistoryView.day(session.startedAt)) \(HistoryView.span(session)): " + session.plays.map { play in
+                    "[\(play.deck)] \(model.history.tracks[play.trackID]?.title ?? "?")"
+                        + (play.fromTrackID.map { " (from \(model.history.tracks[$0]?.title ?? "?"))" } ?? "")
+                }.joined(separator: " → "))
+            }
         case "volume":
             model.mixer.masterVolume = Double(argument) ?? 1
         case "crossfader":
             model.mixer.crossfader = Double(argument) ?? 0
+        case "meters":
+            // meters:-3,2 has the master meter show those levels, left and right, in decibels: scripted
+            // checks play in silence, which leaves it dark. meters:off goes back to the mix's own.
+            let levels = argument.split(separator: ",").compactMap { Float($0) }.map { Float(pow(10, Double($0) / 20)) }
+            model.mixer.masterPeaksForTesting = levels.count == 2 ? (levels[0], levels[1]) : nil
         case "record":
             model.mixer.toggleRecording()
             log("recording \(model.mixer.isRecording) → \(model.mixer.lastRecording?.path ?? "-")")
@@ -327,9 +422,14 @@ enum DebugDriver {
                     deck.id.name, deck.track?.title ?? "(empty)", state.isPlaying ? "playing" : "stopped", state.position, state.speed,
                     deck.bpm.map { String(format: "%.2f", $0) } ?? "-", deck.tempoOffset * 100, deck.isSynced ? "on" : "off",
                     deck.isMaster ? "yes" : "no", deck.phaseError.map { String(format: "%+.3f", $0) } ?? "-",
-                    deck.grid.map { "\($0.count) beats" } ?? "none", deck.detail == nil ? "none" : "yes", deck.level))
+                    deck.grid.map { "\($0.count) beats" } ?? "none", deck.detail == nil ? "none" : "yes", deck.level)
+                    + (deck.isCueing ? " | cue held" : ""))
             }
-            log(String(format: "master level %.2f clipping %@", model.mixer.masterLevel, model.mixer.isClipping ? "yes" : "no"))
+            log(String(
+                format: "master level %.2f (%.1f dB) lights %d/%d over %@ | channel lights %@",
+                model.mixer.masterLevel, MeterScale.decibels(model.mixer.masterLevel), model.mixer.masterMeters[0].lit,
+                model.mixer.masterMeters[1].lit, model.mixer.isClipping ? "yes" : "no",
+                model.mixer.decks.map { "\($0.meter.lit)" }.joined(separator: "/")))
         case "sidebar":
             if argument == "all" {
                 model.sidebar = .all
